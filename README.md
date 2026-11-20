@@ -52,6 +52,14 @@ Two honest statements that the code and docs repeat:
 
 Requirements: **Python 3.9 or newer**.
 
+The quickest way is from PyPI:
+
+```bash
+pip install decryptre
+```
+
+Or install from source:
+
 ```bash
 git clone https://github.com/JasonMarvello/DecryptRE.git
 cd DecryptRE
