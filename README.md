@@ -101,6 +101,25 @@ standard input.
 
 ---
 
+## Interactive mode
+
+Run it with no arguments and you get a menu instead of flags:
+
+```bash
+decryptre
+```
+
+Arrow keys (or `j`/`k`) move, `1`-`6` jump straight to an option, Enter
+selects, `q` goes back and Ctrl+C quits. Choose **Decrypt / decode text**,
+paste ciphertext or a file path, optionally give a passphrase, then pick from
+the ranked results and ask for another layer if the text is still encoded.
+Encrypt and identify work the same way.
+
+`decryptre --help` still prints the full command reference, and when input is
+piped (`cat cipher.txt | decryptre`) the help is printed instead of the menu.
+
+---
+
 ## Commands
 
 ### `decryptre decrypt`

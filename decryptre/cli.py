@@ -365,7 +365,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        # Bare `decryptre` opens the interactive menu; when input is piped or
+        # redirected there is nothing to navigate, so show the help instead.
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            from .interactive import run
+
+            return run()
+        parser.print_help()
+        return 0
+    args = parser.parse_args(arguments)
     return args.func(args)
 
 
