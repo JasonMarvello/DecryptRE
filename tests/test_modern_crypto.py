@@ -86,3 +86,37 @@ def test_unknown_algorithm_rejected():
     token = pack({"v": 1, "alg": "rot13"})
     with pytest.raises(ContainerError):
         modern_crypto.decrypt_modern(token, PASSPHRASE)
+
+
+@pytest.mark.parametrize("kdf", ["pbkdf2", "scrypt"])
+def test_des3_roundtrip(kdf):
+    token = modern_crypto.encrypt_des3(MESSAGE, PASSPHRASE, kdf=kdf)
+    assert is_container(token)
+    assert unpack(token)["alg"] == "des3-cbc"
+    assert modern_crypto.decrypt_des3(token, PASSPHRASE) == MESSAGE
+
+
+def test_des3_wrong_passphrase_returns_none():
+    token = modern_crypto.encrypt_des3(MESSAGE, PASSPHRASE)
+    assert modern_crypto.try_decrypt(token, "wrong") is None
+
+
+def test_des3_dictionary_attack():
+    token = modern_crypto.encrypt_des3(MESSAGE, PASSPHRASE)
+    results = modern_crypto.dictionary_attack(token, ["nope", PASSPHRASE], top=2)
+    assert results
+    assert results[0].text == MESSAGE
+    assert results[0].verified is True
+    assert results[0].params["alg"] == "des3-cbc"
+
+
+def test_des3_empty_plaintext():
+    token = modern_crypto.encrypt_des3("", PASSPHRASE)
+    assert modern_crypto.decrypt_des3(token, PASSPHRASE) == ""
+
+
+def test_try_decrypt_any_reports_algorithm():
+    token = modern_crypto.encrypt_des3(MESSAGE, PASSPHRASE)
+    plain, alg = modern_crypto.try_decrypt_any(token, PASSPHRASE)
+    assert plain == MESSAGE
+    assert alg == "des3-cbc"

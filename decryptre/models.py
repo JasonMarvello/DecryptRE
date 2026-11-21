@@ -16,7 +16,10 @@ class Candidate:
         score: English-likelihood score from :mod:`decryptre.scorer`.
             Higher is better.
         depth: How many peel steps produced this candidate (0 = input).
-        parent: Human-readable description of where this came from.
+        parent: Human-readable description of the previous step.
+        chain: Full human-readable path, e.g. ``"Base64 -> Vigenere"``.
+        verified: True when the method itself proved the key (an AEAD tag
+            checked out). Verified results outrank every heuristic guess.
     """
 
     text: str
@@ -25,6 +28,8 @@ class Candidate:
     score: float = 0.0
     depth: int = 0
     parent: str = ""
+    chain: str = ""
+    verified: bool = False
 
     def signature(self) -> str:
         """A stable key used for cycle detection and de-duplication."""

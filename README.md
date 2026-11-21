@@ -6,8 +6,8 @@ methods.
 
 It handles encodings (Base64, Base32, hex, URL, ASCII85), classical ciphers
 (Caesar/ROT-N, Atbash, Vigenère, Rail Fence, simple substitution), XOR, and
-passphrase-based modern crypto (Fernet and AES). It also recognises common
-hashes.
+passphrase-based modern crypto (Fernet, AES-256 and legacy 3DES). It also
+recognises common hashes.
 
 **Everything runs offline.** There are no API calls, no telemetry, no remote
 wordlists, and no internet connection is needed after installation. A test in
@@ -35,8 +35,8 @@ The authors accept no responsibility for misuse. See [LICENSE](LICENSE).
 | Text is encoded (Base64, hex, ...) | Decodes it. Encodings are not encryption. |
 | Text uses a classical cipher | Tries the parameters and ranks results by how much they look like English. |
 | Text uses XOR with a short key | Recovers single-byte keys and repeating keys (up to 32 bytes). |
-| Text uses Fernet / AES **and you know the passphrase** | Decrypts it. |
-| Text uses Fernet / AES **and you do not know the passphrase** | Tries every passphrase in an offline wordlist (a *dictionary attack*). If the passphrase is not in the list, it cannot be recovered. That is the point of modern cryptography. |
+| Text uses Fernet / AES / 3DES **and you know the passphrase** | Decrypts it. |
+| Text uses Fernet / AES / 3DES **and you do not know the passphrase** | Tries every passphrase in an offline wordlist (a *dictionary attack*). If the passphrase is not in the list, it cannot be recovered. That is the point of modern cryptography. |
 | Text is a hash (MD5, SHA-1, SHA-256, SHA-512) | Identifies the likely algorithm and clearly states that hashes are **one-way** and cannot be decrypted. |
 
 Two honest statements that the code and docs repeat:
@@ -94,6 +94,12 @@ decryptre decrypt --input "decryptre:v1:..." --method aes --key "correct horse b
 
 # Identify a hash
 decryptre identify --input 5d41402abc4b2a76b9719d911017c592
+
+# See every method, what it needs and a runnable example
+decryptre methods
+
+# A known passphrase in auto mode: the cipher verifies it
+decryptre decrypt --input "decryptre:v1:..." --key "correct horse battery staple"
 ```
 
 `--input` accepts a **file path**, a **literal string**, or `-` to read from
@@ -130,11 +136,11 @@ decryptre decrypt --input <file|text|-> [options]
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--method NAME` | `auto` | Method to use. `auto` tries everything. |
-| `--key TEXT` | none | Passphrase or cipher key. |
+| `--method NAME` | `auto` | `auto` peels every layer; or name one method (see `decryptre methods`). |
+| `--key TEXT` | none | Passphrase or cipher key. In auto mode a passphrase is also tried against AES/Fernet/3DES containers and verified by the cipher. |
 | `--shift N` | try all | Caesar shift. |
 | `--rails N` | try 2-12 | Rail Fence rails. |
-| `--wordlist PATH` | bundled list | Passphrase list for Fernet/AES. |
+| `--wordlist PATH` | bundled list | Passphrase list for Fernet/AES/3DES. |
 | `--no-wordlist` | off | Skip the bundled wordlist. |
 | `--no-substitution` | off | Skip the slow substitution solver in `auto` mode. |
 | `--max-depth N` | `3` | Maximum number of layers to peel in `auto` mode. |
@@ -152,6 +158,16 @@ Uses the same method names. `--key` is required for Vigenère, XOR, Fernet and
 AES. Extra options: `--shift` (Caesar, default 3), `--rails` (Rail Fence),
 `--aes-mode gcm|cbc` (default `gcm`), `--kdf pbkdf2|scrypt` (default
 `pbkdf2`), `--iterations` (PBKDF2, default 200000).
+
+### `decryptre methods`
+
+```bash
+decryptre methods
+```
+
+Lists every supported method with its aliases, whether `auto` tries it,
+what `--key` means for it, and a runnable example. Use it instead of
+guessing method names.
 
 ### `decryptre identify`
 
@@ -180,7 +196,8 @@ you that these are one-way functions. It never claims to "decrypt" a hash.
 | Simple substitution | `sub` | yes | best effort (trigram solver) | May be partially wrong; read the output. |
 | XOR | `xor` | yes | yes (single byte, repeating key up to 32 bytes) | `decryptre:xor:` output is understood automatically. |
 | Fernet | `fernet` | yes | dictionary attack only | PBKDF2 + SHA-256. |
-| AES-GCM / AES-CBC | `aes`, `aes-gcm`, `aes-cbc` | yes | dictionary attack only | PBKDF2 or scrypt KDF. |
+| AES-256-GCM / AES-256-CBC | `aes`, `aes-256`, `aes-gcm`, `aes-cbc` | yes | dictionary attack only | 256-bit key; PBKDF2 or scrypt KDF. |
+| 3DES-CBC | `des3`, `3des`, `des-ede3` | yes | dictionary attack only | **Legacy/compatibility only: do not use for new encryption.** |
 
 ---
 
@@ -191,8 +208,10 @@ Auto mode peels one layer at a time:
 1. Try every applicable encoding decode.
 2. Try the classical cipher breakers.
 3. Try XOR when the text is binary or just came out of an encoding.
-4. Try the passphrase dictionary on DecryptRE containers.
-5. Score every result with an offline English model (letter frequencies,
+4. Try a supplied passphrase against DecryptRE containers; the cipher
+   verifies it, so the result is marked high confidence.
+5. Otherwise try the passphrase dictionary on DecryptRE containers.
+6. Score every result with an offline English model (letter frequencies,
    trigrams and common words), keep the best few as the next frontier, and
    repeat up to `--max-depth`.
 
@@ -201,15 +220,20 @@ A visited set prevents cycles such as Base64 that decodes to itself, and
 they are printed best-first so you can choose:
 
 ```text
-[1] score= -6.430  method=vigenere  key=lantern
+[1] Vigenere  ·  key "lantern"  ·  confidence: high
+    reads like ordinary English.
     The password is hidden under the third stone on the beach.
 
-[2] score=-10.068  method=vigenere  key=nheqqlmwk
+[2] Vigenere  ·  key "nheqqlmwk"  ·  confidence: low
+    weak English signal; probably a wrong guess.
     Ran soytlerp it eirune ewyot apl tleog lyfor uc hig aidie.
 ```
 
-Higher (less negative) scores look more like English. They are a ranking aid,
-not a probability.
+Each result names the method, the recovered key or parameters, the path
+that produced it, and a plain-language confidence note. Passphrase results
+verified by the cipher are always listed first and say so. `--verbose` adds
+the raw score and search depth; the score is a ranking aid, not a
+probability.
 
 ---
 
@@ -237,7 +261,9 @@ decryptre:v1:<urlsafe-base64 of a JSON object>
 ```
 
 Fernet containers store the Fernet token plus the salt and iteration count.
-AES-GCM authenticates the whole envelope; AES-CBC is validated by padding.
+3DES containers use the same envelope with `"alg": "des3-cbc"` and an
+8-byte IV. AES-GCM authenticates the whole envelope; AES-CBC and 3DES-CBC
+are validated by padding.
 A wrong passphrase raises a clear error instead of printing garbage.
 
 XOR encryption prints `decryptre:xor:<base64>` for the same reason: it keeps
@@ -279,8 +305,11 @@ included, never any text from the source.
 
 ## Limitations
 
-- **Modern crypto is not brute-forced.** Fernet/AES are only opened when the
-  passphrase is supplied or present in the wordlist.
+- **Modern crypto is not brute-forced.** Fernet/AES/3DES are only opened when
+  the passphrase is supplied or present in the wordlist.
+- **3DES is legacy.** Its 64-bit block and 112-bit effective key are
+  obsolete. It is included only to read old data; use AES-256 for anything
+  new.
 - **Short text is hard.** Vigenère and substitution need a reasonable amount
   of text; a five-word message may not be enough.
 - **Substitution solving is best effort.** It usually solves a paragraph, but
@@ -317,6 +346,7 @@ decryptre/
   containers.py     the decryptre:v1 envelope
   ngrams.py         offline English trigram model
   scorer.py         English-likelihood scoring
+  present.py        method names, parameters and confidence wording
   auto_detect.py    layered search
   cli.py            the command line
   data/             trigram counts (+ source notes)

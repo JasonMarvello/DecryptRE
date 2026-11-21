@@ -181,7 +181,9 @@ def looks_like(text: str, name: str) -> bool:
     if len(cleaned) < 4:
         return False
     if name == "base64":
-        return len(cleaned) >= 8 and bool(_B64_RE.match(cleaned)) and len(cleaned) % 4 != 1
+        # Four characters is enough for "hi"; short tokens are still cheap to
+        # try, and a failed decode is discarded immediately.
+        return len(cleaned) >= 4 and bool(_B64_RE.match(cleaned)) and len(cleaned) % 4 != 1
     if name == "base32":
         return len(cleaned) >= 8 and bool(_B32_RE.match(cleaned))
     if name == "base16":

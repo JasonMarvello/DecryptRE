@@ -13,7 +13,7 @@ import sys
 import textwrap
 from typing import List, Optional, Sequence, Tuple
 
-from . import __version__, classical, encodings, modern_crypto, xor
+from . import __version__, classical, encodings, modern_crypto, present, xor
 from .auto_detect import detect
 from .cli import _xor_wrapper, load_wordlist, read_input
 from .models import Candidate
@@ -198,20 +198,26 @@ def _results_screen(results: List[Candidate]) -> None:
     while True:
         labels = []
         for candidate in results:
-            params = candidate.describe_params()
             preview = candidate.text.replace("\n", " ").strip()
-            if len(preview) > 58:
-                preview = preview[:55] + "..."
-            label = f"{preview}   [{candidate.method} {params}]".rstrip()
-            labels.append(label)
+            if len(preview) > 48:
+                preview = preview[:45] + "..."
+            name = present.display_name(candidate.method, candidate.params)
+            level, _ = present.confidence(candidate)
+            labels.append(f"{preview}   [{name} · {level}]")
 
         choice = menu("Pick the result that looks right:", labels)
         if choice is None:
             return
 
         candidate = results[choice]
+        name = present.display_name(candidate.method, candidate.params)
+        params = present.describe_params(candidate.method, candidate.params)
+        level, note = present.confidence(candidate)
         print()
-        print(f"  {candidate.method} {candidate.describe_params()}".rstrip())
+        print(f"  {name} {params}".rstrip())
+        print(f"  confidence: {level} — {note}")
+        if candidate.chain and candidate.depth:
+            print(f"  path: {candidate.chain}")
         show(candidate.text)
 
         actions = [
@@ -235,13 +241,18 @@ def _search(text: str, key: str, quiet: bool = False) -> List[Candidate]:
     """Decrypt ``text`` and return the best candidates."""
     results: List[Candidate] = []
     if key:
-        try:
-            plain = modern_crypto.decrypt_modern(text, key)
+        hit = modern_crypto.try_decrypt_any(text, key)
+        if hit is not None:
+            plain, alg = hit
             results.append(
-                Candidate(plain, "modern", {"alg": "key"}, score_text(plain))
+                Candidate(
+                    plain,
+                    "modern",
+                    {"alg": alg, "passphrase": key},
+                    score_text(plain),
+                    verified=True,
+                )
             )
-        except Exception:
-            pass
 
     if not quiet:
         print("  Searching offline (a few seconds for long text)...", flush=True)
@@ -250,6 +261,7 @@ def _search(text: str, key: str, quiet: bool = False) -> List[Candidate]:
         max_depth=3,
         top=6,
         wordlist=[] if key else load_wordlist(),
+        passphrase=key or None,
     )
     for candidate in found:
         if all(candidate.text != existing.text for existing in results):
@@ -285,7 +297,8 @@ ENCRYPT_METHODS: List[Tuple[str, str]] = [
     ("Vigenere", "vigenere"),
     ("Rail Fence", "railfence"),
     ("XOR (passphrase)", "xor"),
-    ("AES (passphrase)", "aes"),
+    ("AES-256 (passphrase)", "aes"),
+    ("3DES (passphrase, legacy)", "des3"),
     ("Fernet (passphrase)", "fernet"),
 ]
 
@@ -324,6 +337,8 @@ def encrypt_flow() -> None:
                 output = _xor_wrapper(xor.xor_encrypt(text, key))
             elif method == "aes":
                 output = modern_crypto.encrypt_aes(text, key)
+            elif method == "des3":
+                output = modern_crypto.encrypt_des3(text, key)
             else:
                 output = modern_crypto.encrypt_fernet(text, key)
     except (ValueError, TypeError) as exc:
@@ -359,17 +374,21 @@ def help_screen() -> None:
 
     decryptre decrypt --input "TEXT"                auto search
     decryptre decrypt --input "TEXT" --method caesar
+    decryptre decrypt --input "TEXT" --key "pass"   auto + known passphrase
     decryptre decrypt --input file.txt --method aes --key "pass"
-    decryptre decrypt --input "TEXT" --key "pass" --method fernet
+    decryptre decrypt --input token.txt --method des3 --key "pass"
     decryptre encrypt --input "TEXT" --method aes --key "pass"
     decryptre identify --input "5d41402abc4b2a76b9719d911017c592"
+    decryptre methods                                every method and example
     decryptre --help                                 full reference
 
   Tips
 
     * --input takes text, a file path, or - to read stdin.
-    * Known passphrase containers: use --method fernet or --method aes.
-      Auto mode would run a 10,000-word list and take minutes.
+    * With --key, auto mode also opens AES/Fernet/3DES containers and the
+      cipher verifies the passphrase, so the result is marked high confidence.
+    * Only DecryptRE (decryptre:v1:) containers can be opened this way.
+    * 3DES exists for legacy data only; do not encrypt new data with it.
     * --top 10 shows more results; --max-depth 4 peels more layers.
     * Everything runs offline: no accounts, no keys, no network.
 

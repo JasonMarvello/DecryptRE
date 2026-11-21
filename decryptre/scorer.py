@@ -63,11 +63,31 @@ COMMON_WORDS = {
 }
 
 
+SHORT_TEXT_SCORE = -60.0
+"""Score used when there is not enough text to judge English-likeness."""
+
+NON_LATIN_SCORE = -18.0
+"""Score for legible text outside the Latin alphabet (the model cannot judge it)."""
+
+
+def _outside_latin_script(text: str) -> int:
+    """Count letters from scripts the English model cannot read (CJK, Cyrillic...).
+
+    High Latin-1 bytes decoded from binary also satisfy ``isalpha``; requiring
+    a codepoint above Latin Extended-B keeps that garbage out of this path.
+    """
+    return sum(1 for ch in text if ch.isalpha() and ord(ch) > 0x024F)
+
+
 def printable_ratio(text: str) -> float:
-    """Fraction of characters that are normal printable text."""
+    """Fraction of characters that are normal printable text.
+
+    ``str.isprintable`` is Unicode-aware, so accents, Cyrillic and CJK count
+    as text instead of being mistaken for binary.
+    """
     if not text:
         return 0.0
-    printable = sum(1 for ch in text if ch in "\n\r\t" or 32 <= ord(ch) <= 126)
+    printable = sum(1 for ch in text if ch in "\n\r\t" or ch.isprintable())
     return printable / len(text)
 
 
@@ -130,15 +150,29 @@ def score_text(text: str) -> float:
 
     letters = sum(1 for ch in text.lower() if "a" <= ch <= "z")
     if letters < 4:
-        return -200.0
+        # Legible non-Latin text (CJK, Cyrillic, Greek...) is outside the
+        # English model. Say so with a distinct score instead of pretending
+        # it is binary garbage.
+        if _outside_latin_script(text) >= 4 and printable_ratio(text) >= 0.95:
+            return NON_LATIN_SCORE
+        return SHORT_TEXT_SCORE
 
     chi = chi_square(text)
     if chi == float("inf"):
         return -200.0
     # Chi-squared is noisy on short samples, so trust it more as text grows.
     # English prose is ~0.1-0.4 once there is enough text; random letters 1.0+.
-    chi_weight = min(1.0, letters / 150.0)
+    # 300 letters (not 150) keeps normal prose from being punished for the
+    # natural unevenness of a medium-length sample.
+    chi_weight = min(1.0, letters / 300.0)
     frequency_part = -2.0 * min(chi, 5.0) * chi_weight
+
+    # Real text is mostly letters and spaces. XOR/parameter noise that happens
+    # to be printable is usually punctuation and digits, and used to outrank
+    # correct English because it has so few letters that the models above
+    # could not penalize it. This term closes that hole.
+    letter_ratio = letters / len(text)
+    script_part = -25.0 * max(0.0, 0.55 - letter_ratio)
 
     # Trigrams carry most of the signal: real words use common sequences.
     trigram_part = trigram_score(text)
@@ -159,7 +193,7 @@ def score_text(text: str) -> float:
 
     return (
         frequency_part + trigram_part + space_part + word_part
-        + case_part + digit_part + vowel_part
+        + case_part + digit_part + vowel_part + script_part
     )
 
 

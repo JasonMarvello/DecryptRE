@@ -2,11 +2,13 @@
 
 import argparse
 import base64
+import binascii
+import re
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from . import __version__, classical, encodings, modern_crypto, xor
+from . import __version__, classical, encodings, modern_crypto, present, xor
 from .auto_detect import XOR_PREFIX, detect
 from .containers import ContainerError
 from .models import Candidate
@@ -36,8 +38,12 @@ METHOD_ALIASES = {
     "url": "url",
     "ascii85": "ascii85",
     "aes": "aes",
+    "aes-256": "aes",
     "aes-cbc": "aes",
     "aes-gcm": "aes",
+    "des3": "des3",
+    "3des": "des3",
+    "des-ede3": "des3",
     "fernet": "fernet",
     "xor": "xor",
     "caesar": "caesar",
@@ -60,8 +66,8 @@ def read_input(value: str) -> str:
     try:
         path = Path(value)
         is_file = len(value) < 4096 and path.is_file()
-    except OSError:
-        # Long tokens and odd names are ciphertext, not paths.
+    except (OSError, ValueError):
+        # Long tokens, NUL bytes and odd names are ciphertext, not paths.
         is_file = False
     if is_file:
         # surrogateescape keeps arbitrary bytes recoverable for XOR.
@@ -86,10 +92,36 @@ def load_wordlist(path: Optional[str] = None) -> List[str]:
 
 
 def _display(text: str) -> str:
-    """Make control characters visible without hiding the plaintext."""
+    """Make control characters visible without hiding readable Unicode."""
     return "".join(
-        ch if ch in "\n\t" or 32 <= ord(ch) <= 126 else f"\\x{ord(ch):02x}"
+        ch if ch in "\n\t" or ch.isprintable() else f"\\x{ord(ch):02x}"
         for ch in text
+    )
+
+
+_B64_SHAPE = re.compile(r"^[A-Za-z0-9+/=_-]+$")
+
+
+def _binary_container_hint(text: str) -> Optional[str]:
+    """Explain a base64 blob that decodes to an unrecognized binary format."""
+    cleaned = "".join(text.split())
+    if len(cleaned) < 24 or not _B64_SHAPE.match(cleaned):
+        return None
+    token = cleaned.replace("-", "+").replace("_", "/")
+    token += "=" * (-len(token) % 4)
+    try:
+        raw = base64.b64decode(token, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    if len(raw) < 16:
+        return None
+    printable = sum(1 for b in raw if 32 <= b <= 126 or b in (9, 10, 13))
+    if printable / len(raw) >= 0.6:
+        return None
+    return (
+        "Note: this looks like base64 around an unrecognized binary container.\n"
+        "      Auto mode only opens DecryptRE's own decryptre:v1 containers; a\n"
+        "      known passphrase cannot be used on an unknown format."
     )
 
 
@@ -98,14 +130,30 @@ def print_candidates(candidates: Iterable[Candidate], verbose: bool = False) -> 
     if not candidates:
         print("No result. Try --method with an explicit cipher, or --max-depth 4.")
         return
+    confident = any(candidate.verified for candidate in candidates)
+    if not confident and candidates[0].score < -8.0:
+        print(
+            "No verified result. The guesses below are ranked by English-likeness,\n"
+            "not proof: treat them as suggestions and read them before trusting them."
+        )
+        print()
     for index, candidate in enumerate(candidates, start=1):
-        params = candidate.describe_params()
-        header = f"[{index}] score={candidate.score:7.3f}  method={candidate.method}"
+        name = present.display_name(candidate.method, candidate.params)
+        params = present.describe_params(candidate.method, candidate.params)
+        label, note = present.confidence(candidate)
+        header = f"[{index}] {name}"
         if params:
-            header += f"  {params}"
-        if verbose and candidate.depth:
-            header += f"  depth={candidate.depth}"
+            header += f"  ·  {params}"
+        header += f"  ·  confidence: {label}"
         print(header)
+        print(f"    {note}")
+        if candidate.chain and candidate.depth:
+            print(f"    path: {candidate.chain}")
+        if verbose:
+            print(
+                f"    score={candidate.score:.3f}  depth={candidate.depth}"
+                f"  method={candidate.method}"
+            )
         for line in _display(candidate.text).splitlines() or [""]:
             print(f"    {line}")
         if index < len(candidates):
@@ -178,7 +226,7 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
             return [Candidate(plain, "xor", {"key": args.key}, score_text(plain))]
         return xor.break_xor(raw, top=args.top)
 
-    if method in ("fernet", "aes"):
+    if method in ("fernet", "aes", "des3"):
         if not args.key:
             words = [] if args.no_wordlist else load_wordlist(args.wordlist)
             if not words:
@@ -190,8 +238,17 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
                     "brute-forced; supply --key if you know it."
                 )
             return results
+        alg = modern_crypto.container_alg(text)
         plain = modern_crypto.decrypt_modern(text, args.key)
-        return [Candidate(plain, "modern", {"alg": method}, score_text(plain))]
+        return [
+            Candidate(
+                plain,
+                "modern",
+                {"alg": alg or method},
+                score_text(plain),
+                verified=True,
+            )
+        ]
 
     raise SystemExit(f"error: unknown method: {method}")
 
@@ -201,7 +258,13 @@ def cmd_decrypt(args) -> int:
     method = _normalise_method(args.method)
 
     if method == "auto":
-        words = [] if args.no_wordlist else load_wordlist(args.wordlist)
+        # A known passphrase disables the dictionary: the cipher verifies the
+        # key, so trying 10,000 wrong ones would only waste time.
+        words = (
+            []
+            if args.key or args.no_wordlist
+            else load_wordlist(args.wordlist)
+        )
         results = detect(
             text,
             max_depth=args.max_depth,
@@ -209,7 +272,13 @@ def cmd_decrypt(args) -> int:
             top=args.top,
             wordlist=words,
             include_substitution=not args.no_substitution,
+            passphrase=args.key,
         )
+        if not any(candidate.verified for candidate in results):
+            hint = _binary_container_hint(text)
+            if hint:
+                print(hint)
+                print()
     else:
         try:
             results = _decrypt_with_method(method, text, args)
@@ -278,6 +347,18 @@ def cmd_encrypt(args) -> int:
             )
         )
         return 0
+    if method == "des3":
+        if not args.key:
+            raise SystemExit("error: --key is required for 3DES")
+        print(
+            modern_crypto.encrypt_des3(
+                text,
+                args.key,
+                kdf=args.kdf,
+                iterations=args.iterations,
+            )
+        )
+        return 0
 
     raise SystemExit(f"error: unknown method: {method}")
 
@@ -303,12 +384,50 @@ def cmd_identify(args) -> int:
 # Parser
 # ---------------------------------------------------------------------------
 
+def cmd_methods(args) -> int:
+    print("Supported methods")
+    print()
+    print(f"  {'Name':<14}{'Aliases':<30}{'Encrypt':<9}{'Auto':<16}Key")
+    print("  " + "-" * 79)
+    for entry in present.METHODS:
+        aliases = ", ".join(entry["aliases"]) or "-"
+        auto = "yes" if entry["auto"] is True else str(entry["auto"])
+        print(
+            f"  {entry['name']:<14}{aliases:<30}"
+            f"{'yes' if entry['encrypt'] else 'no':<9}{auto:<16}{entry['key']}"
+        )
+    print()
+    print("Details")
+    for entry in present.METHODS:
+        print()
+        print(f"  {entry['name']} — {entry['what']}")
+        print(f"    decrypt without a key: {entry['decrypt']}")
+        print(f"    --key means: {entry['key']}")
+        print(f"    example: {entry['example']}")
+    print()
+    print(
+        "Auto mode peels one layer at a time and ranks results by how much they "
+        "look like English.\nAES, Fernet and 3DES cannot be brute-forced: without "
+        "the passphrase they are only opened\nby the bundled word list, or not at all."
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="decryptre",
         description=(
-            "Offline decryption and encryption of text. "
-            "No passphrase mode is a parameter/dictionary search, not a keyspace break."
+            "Offline decryption and encryption of text.\n"
+            "\n"
+            "Quick start:\n"
+            "  decryptre                          open the interactive menu\n"
+            '  decryptre decrypt --input "TEXT"   try every layer, no passphrase needed\n'
+            "  decryptre methods                  list methods and what each needs\n"
+            "\n"
+            "Auto mode tries encodings, then classical ciphers, then XOR, one layer\n"
+            "at a time, and ranks everything by how much it looks like English.\n"
+            "AES, Fernet and 3DES cannot be brute-forced: supply --key or let the\n"
+            "bundled word list try known passphrases. Nothing uses the network."
         ),
         epilog=RESPONSIBLE_USE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -319,21 +438,69 @@ def build_parser() -> argparse.ArgumentParser:
     decrypt = sub.add_parser(
         "decrypt",
         help="decrypt or decode text (auto or a chosen method)",
-        description="Decrypt text. With --method auto every supported layer is tried.",
+        description=(
+            "Decrypt text. --method auto (the default) peels layers: encoding "
+            "decodes first, then\nclassical ciphers, then XOR, then modern "
+            "containers if a key or word list is available."
+        ),
         epilog=RESPONSIBLE_USE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    decrypt.add_argument("--input", required=True, help="file path, literal text, or - for stdin")
-    decrypt.add_argument("--method", default="auto", help="method name or auto (default: auto)")
-    decrypt.add_argument("--key", help="passphrase or cipher key")
-    decrypt.add_argument("--shift", type=int, help="Caesar shift (default: try all)")
-    decrypt.add_argument("--rails", type=int, help="Rail Fence rails (default: try 2-12)")
-    decrypt.add_argument("--wordlist", help="offline passphrase list for modern crypto")
-    decrypt.add_argument("--no-wordlist", action="store_true", help="do not use the bundled wordlist")
-    decrypt.add_argument("--no-substitution", action="store_true", help="skip the slow substitution solver")
-    decrypt.add_argument("--max-depth", type=int, default=3, help="maximum peel layers (default: 3)")
-    decrypt.add_argument("--max-candidates", type=int, default=2000, help="candidate budget (default: 2000)")
-    decrypt.add_argument("--top", type=int, default=5, help="how many results to show (default: 5)")
-    decrypt.add_argument("-v", "--verbose", action="count", default=0, help="show extra detail")
+    decrypt.add_argument(
+        "--input",
+        required=True,
+        help="file path, literal text, or - to read stdin",
+    )
+    decrypt.add_argument(
+        "--method",
+        default="auto",
+        help="auto tries every layer; or name one method (see `decryptre methods`)",
+    )
+    decrypt.add_argument(
+        "--key",
+        help=(
+            "passphrase or cipher key. In auto mode a passphrase is also tried "
+            "against AES/Fernet/3DES containers and is verified by the cipher"
+        ),
+    )
+    decrypt.add_argument(
+        "--shift", type=int, help="Caesar shift to use; omit it to try all 26"
+    )
+    decrypt.add_argument(
+        "--rails", type=int, help="Rail Fence rails to use; omit it to try 2-12"
+    )
+    decrypt.add_argument(
+        "--wordlist",
+        help="file of passphrases to try, one per line (replaces the bundled list)",
+    )
+    decrypt.add_argument(
+        "--no-wordlist",
+        action="store_true",
+        help="do not try the bundled 10,000-passphrase list (faster)",
+    )
+    decrypt.add_argument(
+        "--no-substitution",
+        action="store_true",
+        help="skip the slow substitution solver in auto mode",
+    )
+    decrypt.add_argument(
+        "--max-depth",
+        type=int,
+        default=3,
+        help="how many layers auto may peel (default: 3; more is slower)",
+    )
+    decrypt.add_argument(
+        "--max-candidates",
+        type=int,
+        default=2000,
+        help="work budget per layer (default: 2000); raise it if a stacked cipher is missed",
+    )
+    decrypt.add_argument(
+        "--top", type=int, default=5, help="how many ranked results to print (default: 5)"
+    )
+    decrypt.add_argument(
+        "-v", "--verbose", action="count", default=0, help="add raw scores and depth"
+    )
     decrypt.set_defaults(func=cmd_decrypt)
 
     encrypt = sub.add_parser(
@@ -341,22 +508,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="encrypt or encode text",
         description="Encrypt text with the same methods DecryptRE can decrypt.",
     )
-    encrypt.add_argument("--input", required=True, help="file path, literal text, or - for stdin")
-    encrypt.add_argument("--method", required=True, help="encoding or cipher name")
-    encrypt.add_argument("--key", help="passphrase or cipher key")
-    encrypt.add_argument("--shift", type=int, default=3, help="Caesar shift (default: 3)")
+    encrypt.add_argument(
+        "--input", required=True, help="file path, literal text, or - to read stdin"
+    )
+    encrypt.add_argument(
+        "--method", required=True, help="encoding or cipher name (see `decryptre methods`)"
+    )
+    encrypt.add_argument(
+        "--key",
+        help="passphrase or cipher key; required for Vigenere, XOR, Fernet, AES and 3DES",
+    )
+    encrypt.add_argument(
+        "--shift", type=int, default=3, help="Caesar shift (default: 3)"
+    )
     encrypt.add_argument("--rails", type=int, help="Rail Fence rails")
-    encrypt.add_argument("--aes-mode", default="gcm", choices=["gcm", "cbc"], help="AES mode (default: gcm)")
-    encrypt.add_argument("--kdf", default="pbkdf2", choices=["pbkdf2", "scrypt"], help="key derivation (default: pbkdf2)")
-    encrypt.add_argument("--iterations", type=int, default=modern_crypto.DEFAULT_ITERATIONS, help="PBKDF2 iterations")
+    encrypt.add_argument(
+        "--aes-mode",
+        default="gcm",
+        choices=["gcm", "cbc"],
+        help="AES mode: gcm is authenticated, cbc is the older mode (default: gcm)",
+    )
+    encrypt.add_argument(
+        "--kdf",
+        default="pbkdf2",
+        choices=["pbkdf2", "scrypt"],
+        help="how the passphrase becomes a key (default: pbkdf2)",
+    )
+    encrypt.add_argument(
+        "--iterations",
+        type=int,
+        default=modern_crypto.DEFAULT_ITERATIONS,
+        help="PBKDF2 work factor (default: 200000; higher is slower and stronger)",
+    )
     encrypt.add_argument("-v", "--verbose", action="count", default=0)
     encrypt.set_defaults(func=cmd_encrypt)
+
+    methods = sub.add_parser(
+        "methods",
+        help="list every method, what it needs, and an example",
+        description=(
+            "List every supported method with its aliases, whether auto mode "
+            "tries it, what --key\nmeans for it, and a runnable example."
+        ),
+    )
+    methods.set_defaults(func=cmd_methods)
 
     identify = sub.add_parser(
         "identify",
         help="identify hashes and encodings (hashes cannot be decrypted)",
     )
-    identify.add_argument("--input", required=True, help="file path, literal text, or - for stdin")
+    identify.add_argument(
+        "--input", required=True, help="file path, literal text, or - to read stdin"
+    )
     identify.add_argument("-v", "--verbose", action="count", default=0)
     identify.set_defaults(func=cmd_identify)
 
