@@ -5,6 +5,7 @@ import base64
 import binascii
 import re
 import sys
+import textwrap
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -106,20 +107,72 @@ def _display(text: str) -> str:
 _B64_SHAPE = re.compile(r"^[A-Za-z0-9+/=_-]+$")
 
 
+class OpenSSLScanStatus:
+    """Short progress lines while an OpenSSL wordlist scan runs.
+
+    A 10,000-word scan takes several seconds with no output, which looks like
+    a freeze. Print a starting line and a few milestones. Short wordlists
+    stay quiet because they finish immediately.
+    """
+
+    def __init__(self, stream=None, minimum: int = 500, prefix: str = "") -> None:
+        self.stream = stream or sys.stderr
+        self.minimum = minimum
+        self.prefix = prefix
+        self._started = False
+        self._last_mark = -1
+
+    def __call__(self, done: int, total: int, digest: str) -> None:
+        if total < self.minimum:
+            return
+        if not self._started:
+            print(
+                f"{self.prefix}Trying {total:,} passphrases against the "
+                f"OpenSSL blob with OpenSSL's legacy key derivation "
+                f"(MD5, then SHA-256)...",
+                file=self.stream,
+                flush=True,
+            )
+            self._started = True
+        if done <= 0:
+            self._last_mark = -1
+            return
+        quarter = max(1, total // 4)
+        mark = 4 if done >= total else done // quarter
+        if mark > 0 and mark != self._last_mark:
+            self._last_mark = mark
+            print(
+                f"{self.prefix}  {digest}: {done:,}/{total:,} passphrases",
+                file=self.stream,
+                flush=True,
+            )
+
+
+def _cipher_names() -> str:
+    """Human-readable cipher list for hints and errors."""
+    labels = list(openssl_compat.available_ciphers())
+    aes = [label for label in labels if label.startswith("AES-")]
+    others = [label for label in labels if not label.startswith("AES-")]
+    parts = (["AES-128/192/256-CBC"] if len(aes) == 3 else aes) + others
+    return ", ".join(parts)
+
+
 def _format_hint(text: str, had_key: bool) -> Optional[str]:
     """Explain a recognizable format that auto mode could not open."""
     if openssl_compat.looks_like(text):
         if had_key:
-            return (
-                "This is an OpenSSL 'Salted__' blob, but that passphrase did not\n"
-                "open it. Check the passphrase, or the blob may use a cipher this\n"
-                "build does not support (AES-128/192/256-CBC, 3DES, DES, RC4)."
+            message = (
+                "This is an OpenSSL 'Salted__' blob, but that passphrase did not "
+                "open it. Check the passphrase, or the blob may use a cipher this "
+                f"build does not support ({_cipher_names()})."
             )
-        return (
-            "This is an OpenSSL 'Salted__' blob (openssl enc ...). Pass the\n"
-            "passphrase with --key. Auto mode tries AES-128/192/256-CBC, 3DES,\n"
-            "DES and RC4 using OpenSSL's MD5, SHA-256 and PBKDF2 key derivation."
-        )
+        else:
+            message = (
+                "This is an OpenSSL 'Salted__' blob (openssl enc ...). Pass the "
+                f"passphrase with --key. Auto mode tries {_cipher_names()} with "
+                "OpenSSL's MD5, SHA-256 and PBKDF2 key derivation."
+            )
+        return textwrap.fill(message, width=78)
     return _binary_container_hint(text)
 
 
@@ -254,7 +307,9 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
                 raise SystemExit(
                     "error: OpenSSL blobs need --key (no wordlist loaded)"
                 )
-            results = openssl_compat.dictionary_attack(text, words, top=args.top)
+            results = openssl_compat.dictionary_attack(
+                text, words, top=args.top, progress=OpenSSLScanStatus()
+            )
             if not results:
                 raise SystemExit(
                     "No passphrase in the wordlist opened this OpenSSL blob. "
@@ -265,7 +320,7 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
         if hit is None:
             raise SystemExit(
                 "error: wrong passphrase, or an OpenSSL cipher this build does "
-                "not support (AES-128/192/256-CBC, 3DES, DES, RC4)"
+                f"not support ({_cipher_names()})"
             )
         plain, alg = hit
         return [
@@ -325,6 +380,7 @@ def cmd_decrypt(args) -> int:
             wordlist=words,
             include_substitution=not args.no_substitution,
             passphrase=args.key,
+            openssl_progress=OpenSSLScanStatus(),
         )
         if not any(candidate.verified for candidate in results):
             hint = _format_hint(text, bool(args.key))

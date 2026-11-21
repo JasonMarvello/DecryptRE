@@ -143,6 +143,7 @@ def _expand(
     wordlist: Iterable[str],
     include_substitution: bool,
     passphrase: Optional[str] = None,
+    openssl_progress=None,
 ) -> List[Candidate]:
     """Produce every one-layer child of ``parent``."""
     text = parent.text
@@ -173,7 +174,8 @@ def _expand(
             )
 
     # 0b. OpenSSL `enc` output ("Salted__"). Same idea, different format.
-    if passphrase and parent.depth == 0 and openssl_compat.looks_like(text):
+    #     Checked on every layer: a blob is sometimes wrapped in base64 first.
+    if passphrase and openssl_compat.looks_like(text):
         hit = openssl_compat.try_decrypt(text, passphrase)
         if hit is not None:
             plain, alg = hit
@@ -267,10 +269,12 @@ def _expand(
                 modern_crypto.dictionary_attack(text, wordlist, top=2), depth, parent
             )
         )
-    if wordlist and parent.depth == 0 and openssl_compat.looks_like(text):
+    if wordlist and openssl_compat.looks_like(text):
         children.extend(
             _with_depth(
-                openssl_compat.dictionary_attack(text, wordlist, top=2),
+                openssl_compat.dictionary_attack(
+                    text, wordlist, top=2, progress=openssl_progress
+                ),
                 depth,
                 parent,
             )
@@ -345,6 +349,7 @@ def detect(
     beam: int = 6,
     include_substitution: bool = True,
     passphrase: Optional[str] = None,
+    openssl_progress=None,
 ) -> List[Candidate]:
     """Return the best decryptions found, verified results first."""
     if max_depth < 1:
@@ -377,7 +382,11 @@ def detect(
             if len(children) >= max_candidates:
                 break
             for child in _expand(
-                parent, wordlist, include_substitution, passphrase
+                parent,
+                wordlist,
+                include_substitution,
+                passphrase,
+                openssl_progress,
             ):
                 signature = child.signature()
                 if signature in visited:

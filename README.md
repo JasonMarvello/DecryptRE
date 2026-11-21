@@ -37,7 +37,7 @@ The authors accept no responsibility for misuse. See [LICENSE](LICENSE).
 | Text uses XOR with a short key | Recovers single-byte keys and repeating keys (up to 32 bytes). |
 | Text uses Fernet / AES / 3DES **and you know the passphrase** | Decrypts it. |
 | Text uses Fernet / AES / 3DES **and you do not know the passphrase** | Tries every passphrase in an offline wordlist (a *dictionary attack*). If the passphrase is not in the list, it cannot be recovered. That is the point of modern cryptography. |
-| Text is an OpenSSL `Salted__` blob **and you know the passphrase** | Decrypts it. AES-128/192/256-CBC, 3DES, DES and RC4 are tried with OpenSSL's MD5, SHA-256 or PBKDF2 key derivation. |
+| Text is an OpenSSL `Salted__` blob **and you know the passphrase** | Decrypts it. AES-128/192/256-CBC, 3DES, DES, Blowfish, CAST5 and RC4 are tried with OpenSSL's MD5, SHA-256 or PBKDF2 key derivation. |
 | Text is a hash (MD5, SHA-1, SHA-256, SHA-512) | Identifies the likely algorithm and clearly states that hashes are **one-way** and cannot be decrypted. |
 
 Two honest statements that the code and docs repeat:
@@ -202,7 +202,7 @@ you that these are one-way functions. It never claims to "decrypt" a hash.
 | Fernet | `fernet` | yes | dictionary attack only | PBKDF2 + SHA-256. |
 | AES-256-GCM / AES-256-CBC | `aes`, `aes-256`, `aes-gcm`, `aes-cbc` | yes | dictionary attack only | 256-bit key; PBKDF2 or scrypt KDF. |
 | 3DES-CBC | `des3`, `3des`, `des-ede3` | yes | dictionary attack only | **Legacy/compatibility only: do not use for new encryption.** |
-| OpenSSL `Salted__` | `openssl`, `salted`, `openssl-enc` | no | passphrase or dictionary attack | Decrypt-only output of `openssl enc ...`; AES/3DES/DES/RC4. |
+| OpenSSL `Salted__` | `openssl`, `salted`, `openssl-enc` | no | passphrase or dictionary attack | Decrypt-only output of `openssl enc ...`; AES/3DES/DES/Blowfish/CAST5/RC4. |
 
 ---
 
@@ -216,7 +216,8 @@ Auto mode peels one layer at a time:
 4. Try a supplied passphrase against DecryptRE containers and OpenSSL
    `Salted__` blobs; the cipher verifies it, so the result is marked high
    confidence.
-5. Otherwise try the passphrase dictionary on those containers and blobs.
+5. Otherwise try the passphrase dictionary on those containers and blobs. A
+   short progress line reports the scan so a long one does not look frozen.
 6. Score every result with an offline English model (letter frequencies,
    trigrams and common words), keep the best few as the next frontier, and
    repeat up to `--max-depth`.
@@ -318,7 +319,7 @@ included, never any text from the source.
   new.
 - **OpenSSL support is limited to `Salted__` blobs.** Output from
   `openssl enc ... -salt` is understood; `-nosalt`, raw `-K`/`-iv` keys and
-  ciphers outside AES/3DES/DES/RC4 are not.
+  ciphers outside AES/3DES/DES/Blowfish/CAST5/RC4 are not.
 - **Short text is hard.** Vigenère and substitution need a reasonable amount
   of text; a five-word message may not be enough.
 - **Substitution solving is best effort.** It usually solves a paragraph, but

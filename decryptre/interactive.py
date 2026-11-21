@@ -15,7 +15,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from . import __version__, classical, encodings, modern_crypto, present, xor
 from .auto_detect import detect
-from .cli import _xor_wrapper, load_wordlist, read_input
+from .cli import OpenSSLScanStatus, _xor_wrapper, load_wordlist, read_input
 from .models import Candidate
 from .scorer import score_text
 
@@ -262,6 +262,7 @@ def _search(text: str, key: str, quiet: bool = False) -> List[Candidate]:
         top=6,
         wordlist=[] if key else load_wordlist(),
         passphrase=key or None,
+        openssl_progress=OpenSSLScanStatus(stream=sys.stdout, prefix="  "),
     )
     for candidate in found:
         if all(candidate.text != existing.text for existing in results):
