@@ -19,7 +19,7 @@ Two rules keep the ranking honest:
 import base64
 from typing import Dict, Iterable, List, Optional
 
-from . import classical, encodings, modern_crypto, xor
+from . import classical, encodings, modern_crypto, openssl_compat, xor
 from .containers import is_container
 from .models import Candidate
 from .present import display_name
@@ -172,6 +172,21 @@ def _expand(
                 )
             )
 
+    # 0b. OpenSSL `enc` output ("Salted__"). Same idea, different format.
+    if passphrase and parent.depth == 0 and openssl_compat.looks_like(text):
+        hit = openssl_compat.try_decrypt(text, passphrase)
+        if hit is not None:
+            plain, alg = hit
+            add(
+                Candidate(
+                    plain,
+                    "openssl",
+                    {"alg": alg, "passphrase": passphrase},
+                    score_text(plain),
+                    verified=True,
+                )
+            )
+
     # 1. XOR wrapper produced by `decryptre encrypt --method xor`.
     wrapped = _decode_xor_wrapper(text)
     if wrapped is not None:
@@ -250,6 +265,14 @@ def _expand(
         children.extend(
             _with_depth(
                 modern_crypto.dictionary_attack(text, wordlist, top=2), depth, parent
+            )
+        )
+    if wordlist and parent.depth == 0 and openssl_compat.looks_like(text):
+        children.extend(
+            _with_depth(
+                openssl_compat.dictionary_attack(text, wordlist, top=2),
+                depth,
+                parent,
             )
         )
 

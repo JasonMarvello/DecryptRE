@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from . import __version__, classical, encodings, modern_crypto, present, xor
+from . import __version__, classical, encodings, modern_crypto, openssl_compat, present, xor
 from .auto_detect import XOR_PREFIX, detect
 from .containers import ContainerError
 from .models import Candidate
@@ -44,6 +44,10 @@ METHOD_ALIASES = {
     "des3": "des3",
     "3des": "des3",
     "des-ede3": "des3",
+    "openssl": "openssl",
+    "salted": "openssl",
+    "salted__": "openssl",
+    "openssl-enc": "openssl",
     "fernet": "fernet",
     "xor": "xor",
     "caesar": "caesar",
@@ -100,6 +104,23 @@ def _display(text: str) -> str:
 
 
 _B64_SHAPE = re.compile(r"^[A-Za-z0-9+/=_-]+$")
+
+
+def _format_hint(text: str, had_key: bool) -> Optional[str]:
+    """Explain a recognizable format that auto mode could not open."""
+    if openssl_compat.looks_like(text):
+        if had_key:
+            return (
+                "This is an OpenSSL 'Salted__' blob, but that passphrase did not\n"
+                "open it. Check the passphrase, or the blob may use a cipher this\n"
+                "build does not support (AES-128/192/256-CBC, 3DES, DES, RC4)."
+            )
+        return (
+            "This is an OpenSSL 'Salted__' blob (openssl enc ...). Pass the\n"
+            "passphrase with --key. Auto mode tries AES-128/192/256-CBC, 3DES,\n"
+            "DES and RC4 using OpenSSL's MD5, SHA-256 and PBKDF2 key derivation."
+        )
+    return _binary_container_hint(text)
 
 
 def _binary_container_hint(text: str) -> Optional[str]:
@@ -226,6 +247,37 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
             return [Candidate(plain, "xor", {"key": args.key}, score_text(plain))]
         return xor.break_xor(raw, top=args.top)
 
+    if method == "openssl":
+        if not args.key:
+            words = [] if args.no_wordlist else load_wordlist(args.wordlist)
+            if not words:
+                raise SystemExit(
+                    "error: OpenSSL blobs need --key (no wordlist loaded)"
+                )
+            results = openssl_compat.dictionary_attack(text, words, top=args.top)
+            if not results:
+                raise SystemExit(
+                    "No passphrase in the wordlist opened this OpenSSL blob. "
+                    "Supply --key if you know it."
+                )
+            return results
+        hit = openssl_compat.try_decrypt(text, args.key)
+        if hit is None:
+            raise SystemExit(
+                "error: wrong passphrase, or an OpenSSL cipher this build does "
+                "not support (AES-128/192/256-CBC, 3DES, DES, RC4)"
+            )
+        plain, alg = hit
+        return [
+            Candidate(
+                plain,
+                "openssl",
+                {"alg": alg, "passphrase": args.key},
+                score_text(plain),
+                verified=True,
+            )
+        ]
+
     if method in ("fernet", "aes", "des3"):
         if not args.key:
             words = [] if args.no_wordlist else load_wordlist(args.wordlist)
@@ -275,7 +327,7 @@ def cmd_decrypt(args) -> int:
             passphrase=args.key,
         )
         if not any(candidate.verified for candidate in results):
-            hint = _binary_container_hint(text)
+            hint = _format_hint(text, bool(args.key))
             if hint:
                 print(hint)
                 print()
@@ -427,7 +479,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Auto mode tries encodings, then classical ciphers, then XOR, one layer\n"
             "at a time, and ranks everything by how much it looks like English.\n"
             "AES, Fernet and 3DES cannot be brute-forced: supply --key or let the\n"
-            "bundled word list try known passphrases. Nothing uses the network."
+            "bundled word list try known passphrases. OpenSSL 'Salted__' blobs\n"
+            "(openssl enc ...) are opened the same way. Nothing uses the network."
         ),
         epilog=RESPONSIBLE_USE,
         formatter_class=argparse.RawDescriptionHelpFormatter,

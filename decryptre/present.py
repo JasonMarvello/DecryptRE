@@ -23,6 +23,7 @@ DISPLAY_NAMES = {
     "substitution": "Simple substitution",
     "xor": "XOR",
     "modern": "Modern crypto",
+    "openssl": "OpenSSL",
 }
 
 ALG_NAMES = {
@@ -166,6 +167,16 @@ METHODS: List[Dict[str, Any]] = [
         "example": 'decryptre decrypt --input "decryptre:v1:..." --method aes --key "pass"',
     },
     {
+        "name": "openssl",
+        "aliases": ["salted", "openssl-enc"],
+        "encrypt": False,
+        "decrypt": "passphrase (AES/3DES/DES/RC4)",
+        "auto": "yes, with a key or wordlist",
+        "key": "passphrase",
+        "what": "OpenSSL `enc` salted output (Salted__), encrypted by another tool. Decrypt-only.",
+        "example": 'decryptre decrypt --input "U2FsdGVkX1..." --method openssl --key "pass"',
+    },
+    {
         "name": "des3",
         "aliases": ["3des", "des-ede3"],
         "encrypt": True,
@@ -183,6 +194,8 @@ def display_name(method: str, params: Dict[str, Any] = None) -> str:
     if method == "modern":
         alg = (params or {}).get("alg")
         return ALG_NAMES.get(str(alg), f"Modern crypto ({alg})")
+    if method == "openssl":
+        return str((params or {}).get("alg", "OpenSSL salted"))
     return DISPLAY_NAMES.get(method, method)
 
 
@@ -191,7 +204,7 @@ def describe_params(method: str, params: Dict[str, Any]) -> str:
     if not params:
         return ""
     parts: List[str] = []
-    if method == "modern":
+    if method in ("modern", "openssl"):
         if "passphrase" in params:
             parts.append(f'passphrase "{params["passphrase"]}"')
         return ", ".join(parts)
@@ -219,6 +232,12 @@ def describe_params(method: str, params: Dict[str, Any]) -> str:
 def confidence(candidate) -> Tuple[str, str]:
     """Return ``(label, explanation)`` for a candidate's trustworthiness."""
     if candidate.verified:
+        if candidate.method == "openssl":
+            return (
+                "high",
+                "the passphrase produced valid padding and readable UTF-8 "
+                "(OpenSSL blobs carry no authentication tag).",
+            )
         return (
             "high",
             "the passphrase was verified by the cipher itself (authentication tag).",

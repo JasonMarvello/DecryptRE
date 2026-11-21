@@ -377,6 +377,7 @@ def help_screen() -> None:
     decryptre decrypt --input "TEXT" --key "pass"   auto + known passphrase
     decryptre decrypt --input file.txt --method aes --key "pass"
     decryptre decrypt --input token.txt --method des3 --key "pass"
+    decryptre decrypt --input "U2FsdGVkX1..." --key "pass"   # OpenSSL blob
     decryptre encrypt --input "TEXT" --method aes --key "pass"
     decryptre identify --input "5d41402abc4b2a76b9719d911017c592"
     decryptre methods                                every method and example
