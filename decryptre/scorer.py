@@ -87,7 +87,16 @@ def printable_ratio(text: str) -> float:
     """
     if not text:
         return 0.0
-    printable = sum(1 for ch in text if ch in "\n\r\t" or ch.isprintable())
+    # Most text scored by the attacks is entirely printable; let the C-level
+    # check answer that case without building a Python generator.
+    if text.isprintable():
+        return 1.0
+    printable = (
+        sum(map(str.isprintable, text))
+        + text.count("\n")
+        + text.count("\r")
+        + text.count("\t")
+    )
     return printable / len(text)
 
 

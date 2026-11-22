@@ -6,10 +6,20 @@ import binascii
 import re
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from . import __version__, classical, encodings, modern_crypto, openssl_compat, present, xor
+from . import (
+    __version__,
+    classical,
+    encodings,
+    incremental,
+    modern_crypto,
+    openssl_compat,
+    present,
+    xor,
+)
 from .auto_detect import XOR_PREFIX, detect
 from .containers import ContainerError
 from .models import Candidate
@@ -252,6 +262,267 @@ def _unwrap_xor(text: str) -> Optional[bytes]:
 
 
 # ---------------------------------------------------------------------------
+# incremental passphrase search (opt-in, OpenSSL only)
+# ---------------------------------------------------------------------------
+
+
+class IncrementalStatus:
+    """Throttled progress line for an incremental search."""
+
+    def __init__(self, stream=None, interval: float = 2.0) -> None:
+        self.stream = stream or sys.stderr
+        self.interval = interval
+        self._last = 0.0
+
+    def __call__(self, info) -> None:
+        now = time.monotonic()
+        if now - self._last < self.interval:
+            return
+        self._last = now
+        print(
+            f"  length {info.length}: {info.position:,}/{info.length_total:,} "
+            f"({info.passphrases_done:,} tried, {info.rate:,.0f}/s, "
+            f"ETA {incremental.format_duration(info.eta_seconds)})",
+            file=self.stream,
+            flush=True,
+        )
+
+
+def _confirm_incremental(
+    estimated_seconds: float, assume_yes: bool = False
+) -> None:
+    """Ask before a long run; refuse rather than assume "yes" when piped."""
+    if assume_yes or estimated_seconds <= incremental.CONFIRM_THRESHOLD_SECONDS:
+        return
+    minutes = incremental.CONFIRM_THRESHOLD_SECONDS / 60
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "error: the estimated search time exceeds "
+            f"{minutes:.0f} minutes; re-run with --yes to continue "
+            "non-interactively"
+        )
+    print(
+        f"Estimated search time exceeds {minutes:.0f} minutes. "
+        "Continue? [y/N] ",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
+    answer = sys.stdin.readline().strip().lower()
+    if answer not in ("y", "yes"):
+        raise SystemExit("cancelled")
+
+
+def _incremental_decrypt(text: str, args) -> List[Candidate]:
+    """Exhaustively try a charset/length space against an OpenSSL blob."""
+    try:
+        prepared = openssl_compat.prepare_legacy_attempt(text)
+    except openssl_compat.OpenSSLError as exc:
+        raise SystemExit(f"error: {exc}")
+    if prepared.variant_count == 0:
+        raise SystemExit(
+            "error: no supported block cipher fits this blob; use --key instead"
+        )
+
+    allow_risky = args.i_understand_the_risk
+    workers = (
+        args.workers
+        if args.workers is not None
+        else openssl_compat.default_workers()
+    )
+    if args.resume:
+        state_path = (
+            Path(args.state_file).expanduser()
+            if args.state_file
+            else incremental.default_state_path(prepared.digest)
+        )
+        try:
+            state = incremental.SearchState.load(state_path)
+        except ValueError as exc:
+            raise SystemExit(f"error: cannot resume: {exc}")
+        if args.charset is not None:
+            requested = incremental.resolve_charset(args.charset)
+            if requested != state.charset:
+                raise SystemExit(
+                    "error: --charset does not match the saved checkpoint; "
+                    "start a fresh run to change it"
+                )
+        if args.min_length is not None and args.min_length != state.min_length:
+            raise SystemExit(
+                "error: --min-length does not match the saved checkpoint"
+            )
+        if args.max_length is not None and args.max_length != state.max_length:
+            raise SystemExit(
+                "error: --max-length does not match the saved checkpoint"
+            )
+        if (
+            state.max_length > incremental.MAX_LENGTH_WITHOUT_OVERRIDE
+            and not allow_risky
+        ):
+            raise SystemExit(
+                "error: this checkpoint used --max-length above "
+                f"{incremental.MAX_LENGTH_WITHOUT_OVERRIDE}; add "
+                "--i-understand-the-risk to resume it"
+            )
+        try:
+            incremental.validate_resume(
+                state, prepared.digest, prepared.variant_count
+            )
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}")
+        if state.complete:
+            raise SystemExit(
+                "error: this incremental search is already complete "
+                f"({state_path}); delete the checkpoint to start over"
+            )
+        charset = state.charset
+        min_length = state.min_length
+        max_length = state.max_length
+    else:
+        try:
+            charset = incremental.resolve_charset(args.charset)
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}")
+        min_length = (
+            incremental.DEFAULT_MIN_LENGTH
+            if args.min_length is None
+            else args.min_length
+        )
+        max_length = (
+            incremental.DEFAULT_MAX_LENGTH
+            if args.max_length is None
+            else args.max_length
+        )
+        try:
+            incremental.validate_lengths(min_length, max_length, allow_risky)
+        except ValueError as exc:
+            raise SystemExit(f"error: {exc}")
+        state = incremental.SearchState.create(
+            prepared.digest,
+            charset,
+            min_length,
+            max_length,
+            prepared.variant_count,
+        )
+        state_path = (
+            Path(args.state_file).expanduser()
+            if args.state_file
+            else incremental.default_state_path(prepared.digest)
+        )
+
+    total_passphrases = incremental.count_passphrases(
+        charset, min_length, max_length
+    )
+    total_trials = total_passphrases * prepared.variant_count
+    remaining = incremental.count_remaining(
+        charset, min_length, max_length, state.next_length, state.skip
+    )
+    try:
+        measurement = incremental.measure_rate(prepared.try_passphrase)
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    estimated_seconds = incremental.estimate_seconds(
+        remaining, measurement.passphrases_per_second
+    )
+
+    print("Incremental passphrase search (exhaustive; opt-in)", file=sys.stderr)
+    print(f"  blob: {prepared.digest[:16]}...", file=sys.stderr)
+    print(f"  charset: {len(charset)} characters", file=sys.stderr)
+    print(f"  lengths: {min_length}..{max_length}", file=sys.stderr)
+    print(
+        f"  passphrases in full space: {total_passphrases:,}",
+        file=sys.stderr,
+    )
+    print(f"  total cipher/KDF trials: {total_trials:,}", file=sys.stderr)
+    print(
+        f"  variants per passphrase: {prepared.variant_count} "
+        f"(2 KDF digests x {len(prepared.ciphers)} block ciphers)",
+        file=sys.stderr,
+    )
+    print(
+        f"  workers: {workers} (pass --workers 1 to disable)",
+        file=sys.stderr,
+    )
+    if args.resume:
+        print(
+            f"  resuming at: length {state.next_length}, "
+            f"position {state.skip:,} ({state.passphrases_done:,} done)",
+            file=sys.stderr,
+        )
+    print(f"  remaining passphrases: {remaining:,}", file=sys.stderr)
+    measured_rate = measurement.passphrases_per_second
+    rate_text = f"{measured_rate:,.0f}" if measured_rate >= 1 else f"{measured_rate:.3g}"
+    print(
+        f"  calibration: {rate_text} passphrases/sec "
+        f"({measurement.samples} sweeps in {measurement.seconds:.2f}s)",
+        file=sys.stderr,
+    )
+    print(
+        "  estimated remaining time: "
+        f"{incremental.format_duration(estimated_seconds)}",
+        file=sys.stderr,
+    )
+    print(
+        "  Note: exhaustive only inside this charset and length range. It is\n"
+        "  exponential and cannot find a passphrase outside those bounds or in\n"
+        "  an OpenSSL -pbkdf2 blob. The scan stops at the first readable hit;\n"
+        "  'Salted__' has no authentication, so that hit means valid padding\n"
+        "  plus readable UTF-8, not cryptographic proof.",
+        file=sys.stderr,
+    )
+
+    _confirm_incremental(estimated_seconds, assume_yes=args.yes)
+
+    try:
+        if workers > 1 and remaining >= incremental.PARALLEL_MIN_PASSPHRASES:
+            result = openssl_compat.parallel_incremental_attack(
+                text,
+                state,
+                state_path,
+                workers,
+                progress=IncrementalStatus(),
+            )
+        else:
+            result = incremental.incremental_attack(
+                state,
+                prepared.try_passphrase,
+                state_path,
+                progress=IncrementalStatus(),
+            )
+    except KeyboardInterrupt:
+        print(
+            f"\nInterrupted. Progress saved to {state_path}.\n"
+            "Re-run the same command with --input plus --resume "
+            f"--state-file \"{state_path}\"",
+            file=sys.stderr,
+        )
+        raise SystemExit(130)
+
+    if result is None:
+        raise SystemExit(
+            "Exhausted every passphrase in the selected charset and length "
+            "range. No readable plaintext was found; try a larger charset, "
+            "a longer --max-length, or the dictionary/--key."
+        )
+
+    passphrase, hit = result
+    plain, alg = hit
+    print(
+        f'Found with passphrase "{passphrase}" at length {len(passphrase)}.',
+        file=sys.stderr,
+    )
+    return [
+        Candidate(
+            plain,
+            "openssl",
+            {"alg": alg, "passphrase": passphrase},
+            score_text(plain),
+            verified=True,
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
 # decrypt
 # ---------------------------------------------------------------------------
 
@@ -301,14 +572,25 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
         return xor.break_xor(raw, top=args.top)
 
     if method == "openssl":
+        if args.incremental:
+            return _incremental_decrypt(text, args)
         if not args.key:
             words = [] if args.no_wordlist else load_wordlist(args.wordlist)
             if not words:
                 raise SystemExit(
                     "error: OpenSSL blobs need --key (no wordlist loaded)"
                 )
+            workers = (
+                args.workers
+                if args.workers is not None
+                else openssl_compat.default_workers()
+            )
             results = openssl_compat.dictionary_attack(
-                text, words, top=args.top, progress=OpenSSLScanStatus()
+                text,
+                words,
+                top=args.top,
+                progress=OpenSSLScanStatus(),
+                workers=workers,
             )
             if not results:
                 raise SystemExit(
@@ -363,6 +645,39 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
 def cmd_decrypt(args) -> int:
     text = read_input(args.input)
     method = _normalise_method(args.method)
+
+    if args.workers is not None:
+        if args.workers < 1:
+            raise SystemExit("error: --workers must be at least 1")
+        if method != "openssl":
+            raise SystemExit(
+                "error: --workers only applies to --method openssl"
+            )
+
+    if args.incremental:
+        if method != "openssl":
+            raise SystemExit(
+                "error: --incremental requires --method openssl; auto mode "
+                "never starts an exhaustive search"
+            )
+        if args.key:
+            raise SystemExit(
+                "error: --incremental cannot be combined with --key"
+            )
+    elif (
+        args.charset
+        or args.min_length is not None
+        or args.max_length is not None
+        or args.resume
+        or args.state_file
+        or args.i_understand_the_risk
+        or args.yes
+    ):
+        raise SystemExit(
+            "error: --charset, --min-length, --max-length, --resume, "
+            "--state-file, --i-understand-the-risk and --yes require "
+            "--incremental"
+        )
 
     if method == "auto":
         # A known passphrase disables the dictionary: the cipher verifies the
@@ -586,6 +901,80 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-wordlist",
         action="store_true",
         help="do not try the bundled 10,000-passphrase list (faster)",
+    )
+    decrypt.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "worker processes for explicit OpenSSL wordlist/incremental "
+            "scans (default: CPU count, capped at 8; 1 disables)"
+        ),
+    )
+    incremental_options = decrypt.add_argument_group(
+        "incremental passphrase search (opt-in, OpenSSL only)"
+    )
+    incremental_options.add_argument(
+        "--incremental",
+        action="store_true",
+        help=(
+            "exhaustively try every passphrase over a charset; requires "
+            "--method openssl and is never used by auto mode"
+        ),
+    )
+    incremental_options.add_argument(
+        "--charset",
+        action="append",
+        choices=list(incremental.CHARSETS) + ["all"],
+        default=None,
+        help=(
+            "charset component for --incremental; repeat to combine "
+            "(default: lower+upper+digits)"
+        ),
+    )
+    incremental_options.add_argument(
+        "--min-length",
+        type=int,
+        default=None,
+        help="shortest passphrase length for --incremental (default: 1)",
+    )
+    incremental_options.add_argument(
+        "--max-length",
+        type=int,
+        default=None,
+        help=(
+            "longest passphrase length for --incremental (default: 5; "
+            "above 6 requires --i-understand-the-risk)"
+        ),
+    )
+    incremental_options.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue an interrupted --incremental search from its checkpoint",
+    )
+    incremental_options.add_argument(
+        "--state-file",
+        default=None,
+        help=(
+            "checkpoint file for --incremental (default: per-blob file in "
+            "~/.decryptre/incremental)"
+        ),
+    )
+    incremental_options.add_argument(
+        "--i-understand-the-risk",
+        action="store_true",
+        help=(
+            "allow --max-length above 6 (confirmation is still required "
+            "unless --yes)"
+        ),
+    )
+    incremental_options.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "skip the --incremental time-estimate confirmation; does not "
+            "lift the length cap"
+        ),
     )
     decrypt.add_argument(
         "--no-substitution",

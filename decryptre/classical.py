@@ -296,44 +296,72 @@ def substitution_encrypt(text: str, mapping) -> str:
     return "".join(out)
 
 
-def _key_score(key, trigrams, table, floor) -> float:
+_TRIGRAM_SCALE = 26 * 26
+
+
+def _trigram_score_table(table, floor):
+    """Lookup table indexed by three plaintext-letter positions (0-25)."""
+    scores = [floor] * (26 * 26 * 26)
     index = _ALPHA_INDEX
+    for trigram, value in table.items():
+        if len(trigram) == 3:
+            scores[
+                index[trigram[0]] * _TRIGRAM_SCALE
+                + index[trigram[1]] * 26
+                + index[trigram[2]]
+            ] = value
+    return scores
+
+
+def _trigram_score(key, rows, scores) -> float:
+    """Score integer-keyed trigram rows against a precomputed table."""
     total = 0.0
-    for (a, b, c), count in trigrams:
-        total += count * table.get(
-            key[index[a]] + key[index[b]] + key[index[c]], floor
-        )
+    for a, b, c, count in rows:
+        total += count * scores[
+            key[a] * _TRIGRAM_SCALE + key[b] * 26 + key[c]
+        ]
     return total
 
 
-def _anneal(key, trigrams, rng, iterations: int, table, floor):
+def _affected_trigrams(trigrams, first: int, second: int):
+    """Indexes of trigrams whose score can change in a two-letter swap."""
+    return tuple(
+        position
+        for position, (a, b, c, _count) in enumerate(trigrams)
+        if first in (a, b, c) or second in (a, b, c)
+    )
+
+
+def _anneal(key, trigrams, rng, iterations: int, scores, affected_cache):
     """Simulated-annealing swap search over the 26-letter key."""
-    index = _ALPHA_INDEX
-    current = _key_score(key, trigrams, table, floor)
+    current = _trigram_score(key, trigrams, scores)
     best_score, best_key = current, list(key)
+    trigram_scores = [
+        count * scores[key[a] * _TRIGRAM_SCALE + key[b] * 26 + key[c]]
+        for a, b, c, count in trigrams
+    ]
 
     for step in range(iterations):
         i, j = rng.randrange(26), rng.randrange(26)
         if i == j:
             continue
-        affected = [
-            (a, b, c, count)
-            for (a, b, c), count in trigrams
-            if i in (index[a], index[b], index[c])
-            or j in (index[a], index[b], index[c])
-        ]
+        pair = (i, j) if i < j else (j, i)
+        affected = affected_cache.get(pair)
+        if affected is None:
+            affected = _affected_trigrams(trigrams, i, j)
+            affected_cache[pair] = affected
 
-        def local_score():
-            return sum(
-                count * table.get(
-                    key[index[a]] + key[index[b]] + key[index[c]], floor
-                )
-                for a, b, c, count in affected
-            )
-
-        before = local_score()
+        old_scores = [trigram_scores[index] for index in affected]
+        before = sum(old_scores)
         key[i], key[j] = key[j], key[i]
-        after = local_score()
+        after = 0.0
+        for position in affected:
+            a, b, c, count = trigrams[position]
+            value = count * scores[
+                key[a] * _TRIGRAM_SCALE + key[b] * 26 + key[c]
+            ]
+            trigram_scores[position] = value
+            after += value
 
         accept = after >= before
         if not accept:
@@ -345,6 +373,8 @@ def _anneal(key, trigrams, rng, iterations: int, table, floor):
                 best_score, best_key = current, list(key)
         else:
             key[i], key[j] = key[j], key[i]
+            for position, value in zip(affected, old_scores):
+                trigram_scores[position] = value
 
     return best_key
 
@@ -368,18 +398,25 @@ def break_substitution(
     if len(letters) < 30:
         return []
 
-    trigrams = list(Counter(zip(letters, letters[1:], letters[2:])).items())
     index = _ALPHA_INDEX
+    trigrams = [
+        (index[a], index[b], index[c], count)
+        for (a, b, c), count in Counter(
+            zip(letters, letters[1:], letters[2:])
+        ).items()
+    ]
     table, floor = log_table()
+    scores = _trigram_score_table(table, floor)
 
     frequencies = Counter(letters)
     by_cipher_frequency = sorted(ALPHABET, key=lambda c: (-frequencies[c], c))
     by_english_frequency = sorted(ALPHABET, key=lambda c: -ENGLISH_FREQ[c])
-    seed_key = ["a"] * 26
+    seed_key = [0] * 26
     for cipher_letter, plain_letter in zip(by_cipher_frequency, by_english_frequency):
-        seed_key[index[cipher_letter]] = plain_letter
+        seed_key[index[cipher_letter]] = index[plain_letter]
 
     rng = random.Random(seed)
+    affected_cache = {}
     solved = []
     for restart in range(max(1, restarts)):
         key = list(seed_key)
@@ -387,9 +424,14 @@ def break_substitution(
         for _ in range(min(restart, 6)):
             a, b = rng.randrange(26), rng.randrange(26)
             key[a], key[b] = key[b], key[a]
-        best_key = _anneal(key, trigrams, rng, iterations, table, floor)
+        best_key = _anneal(
+            key, trigrams, rng, iterations, scores, affected_cache
+        )
         solved.append(
-            (_key_score(best_key, trigrams, table, floor), "".join(best_key))
+            (
+                _trigram_score(best_key, trigrams, scores),
+                "".join(ALPHABET[position] for position in best_key),
+            )
         )
 
     results = []

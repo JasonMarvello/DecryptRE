@@ -170,10 +170,10 @@ METHODS: List[Dict[str, Any]] = [
         "name": "openssl",
         "aliases": ["salted", "openssl-enc"],
         "encrypt": False,
-        "decrypt": "passphrase (AES/3DES/DES/Blowfish/CAST5/RC4)",
+        "decrypt": "passphrase, wordlist, or opt-in incremental",
         "auto": "yes, with key",
         "key": "passphrase",
-        "what": "OpenSSL `enc` salted output (Salted__): AES/3DES/DES/Blowfish/CAST5/RC4. Decrypt-only.",
+        "what": "OpenSSL `enc` salted output (Salted__): AES/3DES/DES/Blowfish/CAST5/RC4. Decrypt-only; --incremental is opt-in.",
         "example": 'decryptre decrypt --input "U2FsdGVkX1..." --method openssl --key "pass"',
     },
     {

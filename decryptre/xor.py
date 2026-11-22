@@ -60,8 +60,8 @@ def _column_score(data: bytes) -> float:
     if not data:
         return float("-inf")
     sample = data[:SCORE_SAMPLE]
-    ratio = printable_ratio(sample.decode("latin-1"))
     letters = sample.decode("latin-1")
+    ratio = printable_ratio(letters)
     chi = chi_square(letters)
     if chi == float("inf"):
         return -100.0 + ratio
