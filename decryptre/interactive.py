@@ -9,13 +9,20 @@ item, Enter selects, ``q`` goes back, Ctrl+C quits.
 """
 
 import os
+import shutil
 import sys
 import textwrap
+import unicodedata
 from typing import List, Optional, Sequence, Tuple
 
 from . import __version__, classical, encodings, modern_crypto, present, xor
 from .auto_detect import detect
-from .cli import OpenSSLScanStatus, _xor_wrapper, load_wordlist, read_input
+from .cli import (
+    OpenSSLScanStatus,
+    _xor_wrapper,
+    load_common_wordlist,
+    read_input,
+)
 from .models import Candidate
 from .scorer import score_text
 
@@ -42,17 +49,118 @@ def _is_tty() -> bool:
         return False
 
 
-def _enable_ansi() -> None:
-    """Turn on virtual-terminal escape codes on Windows 10+."""
+_ANSI_RESTORE = None
+
+
+def _enable_ansi() -> bool:
+    """Try to enable virtual-terminal output; True only when safe to rely on.
+
+    On Windows the console mode is read first and only the VT bit is added, so
+    unrelated flags are preserved. The previous mode is restored when the
+    menu exits. If anything fails, callers fall back to append-only menus
+    instead of writing raw escape sequences into the console.
+    """
+    global _ANSI_RESTORE
+    _ANSI_RESTORE = None
     if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        handle = kernel32.GetStdHandle(-11)
+        kernel32.GetConsoleMode.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        original = mode.value
+        if original & 0x0004:  # already enabled
+            return True
+        if not kernel32.SetConsoleMode(handle, original | 0x0004):
+            return False
+        _ANSI_RESTORE = (handle, original)
+        return True
+    except Exception:
+        return False
+
+
+def _restore_ansi() -> None:
+    """Put the Windows console mode back if this menu changed it."""
+    global _ANSI_RESTORE
+    if not _ANSI_RESTORE:
         return
+    handle, original = _ANSI_RESTORE
+    _ANSI_RESTORE = None
     try:
         import ctypes
 
-        handle = ctypes.windll.kernel32.GetStdHandle(-11)
-        ctypes.windll.kernel32.SetConsoleMode(handle, 7)
+        ctypes.windll.kernel32.SetConsoleMode(handle, original)
     except Exception:
         pass
+
+
+def _terminal_width() -> int:
+    """Current terminal width, safe when there is no real terminal."""
+    try:
+        return max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
+    except OSError:
+        return 80
+
+
+def _cell_width(text: str) -> int:
+    """Approximate display cells, counting wide CJK characters as two."""
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return width
+
+
+def _fit_text(text: str, width: int) -> str:
+    """Truncate to one physical row, with an ellipsis when needed."""
+    if _cell_width(text) <= width:
+        return text
+    if width <= 3:
+        return "." * max(0, width)
+    kept = []
+    used = 0
+    for char in text:
+        cells = 0 if unicodedata.combining(char) else (
+            2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+        )
+        if used + cells > width - 3:
+            break
+        kept.append(char)
+        used += cells
+    return "".join(kept) + "..."
+
+
+def _fit_option(prefix: str, option: str, width: int) -> str:
+    """Fit an option on one row, keeping its trailing ``[method · level]``.
+
+    The confidence suffix is the part users need to see; truncate the
+    candidate preview before it rather than cutting the suffix off.
+    """
+    available = width - _cell_width(prefix)
+    if available <= 0:
+        return _fit_text(prefix + option, width)
+    if _cell_width(option) <= available:
+        return prefix + option
+    split = option.rfind("   [")
+    if split != -1:
+        suffix = option[split:]
+        room = available - _cell_width(suffix)
+        if room >= 1:
+            head = _fit_text(option[:split].rstrip(), room)
+            return prefix + head + suffix
+    return _fit_text(prefix + option, width)
 
 
 def _read_key() -> str:
@@ -98,17 +206,40 @@ def _read_key() -> str:
     return raw.decode("utf-8", "ignore")
 
 
-def _menu_lines(title: str, options: Sequence[str], index: int) -> List[str]:
-    lines = [""]
+def _menu_rows(
+    title: str, options: Sequence[str], index: int, width: int
+) -> List[str]:
+    """Build a frame as physical terminal rows, never wider than ``width``.
+
+    Every option is forced onto one row so the painted height is exact; the
+    title and hint are wrapped and therefore contribute multiple rows.
+    """
+    rows = [""]
     if title:
-        lines.extend(f"  {line}" for line in title.splitlines())
-        lines.append("")
+        for line in title.splitlines():
+            rows.extend(textwrap.wrap(f"  {line}", width=width) or [""])
+        rows.append("")
     for position, option in enumerate(options):
         marker = "\u276f" if position == index else " "
-        lines.append(f"   {marker} {position + 1}. {option}")
-    lines.append("")
-    lines.append(HINT)
-    return lines
+        prefix = f"   {marker} {position + 1}. "
+        rows.append(_fit_option(prefix, option, width))
+    rows.append("")
+    rows.extend(textwrap.wrap(HINT, width=width) or [HINT])
+    return rows
+
+
+def _paint_rows(rows: Sequence[str], previous_height: int) -> int:
+    """Repaint exactly over the previous frame and return the new height."""
+    parts = []
+    if previous_height:
+        parts.append(f"\033[{previous_height}A")
+    for row in rows:
+        parts.append("\r\033[2K" + row + "\n")
+    if previous_height > len(rows):
+        parts.append("\033[J")
+    sys.stdout.write("".join(parts))
+    sys.stdout.flush()
+    return len(rows)
 
 
 def _fallback_menu(title: str, options: Sequence[str]) -> Optional[int]:
@@ -130,15 +261,17 @@ def _fallback_menu(title: str, options: Sequence[str]) -> Optional[int]:
 
 def menu(title: str, options: Sequence[str]) -> Optional[int]:
     """Show a menu and return the chosen index, or None to go back."""
-    if not _is_tty():
+    if not options:
+        return None
+    if not _is_tty() or not _enable_ansi():
+        # Append-only mode is less pretty but cannot desynchronise a console
+        # that does not understand cursor movement.
         return _fallback_menu(title, options)
 
-    _enable_ansi()
     index = 0
-    lines = _menu_lines(title, options, index)
+    width = _terminal_width()
     sys.stdout.write("\033[?25l")
-    sys.stdout.write("\n".join(lines) + "\n")
-    sys.stdout.flush()
+    height = _paint_rows(_menu_rows(title, options, index, width), 0)
     try:
         while True:
             key = _read_key()
@@ -158,14 +291,14 @@ def menu(title: str, options: Sequence[str]) -> Optional[int]:
                 if 0 <= position < len(options):
                     return position
             if moved:
-                sys.stdout.write(f"\033[{len(lines)}A")
-                lines = _menu_lines(title, options, index)
-                for line in lines:
-                    sys.stdout.write("\r\033[2K" + line + "\n")
-                sys.stdout.flush()
+                width = _terminal_width()
+                height = _paint_rows(
+                    _menu_rows(title, options, index, width), height
+                )
     finally:
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
+        _restore_ansi()
 
 
 def ask(prompt: str) -> str:
@@ -181,9 +314,11 @@ def pause() -> None:
 
 
 def show(text: str) -> None:
-    width = max(40, min(100, (os.get_terminal_size().columns if _is_tty() else 90) - 6))
+    """Print full text with real newlines, but no terminal-corrupting bytes."""
+    width = max(20, min(100, _terminal_width() - 6))
     print()
-    for line in text.splitlines() or [""]:
+    safe = present.visible_controls(text).expandtabs(4)
+    for line in safe.splitlines() or [""]:
         for wrapped in textwrap.wrap(line, width=width) or [""]:
             print(f"  {wrapped}")
     print()
@@ -193,14 +328,26 @@ def show(text: str) -> None:
 # Actions
 # ---------------------------------------------------------------------------
 
+def _ordered(results: Sequence[Candidate]) -> List[Candidate]:
+    """Deterministic ranking: verified first, then score, then signature."""
+    return sorted(
+        results,
+        key=lambda candidate: (
+            candidate.verified,
+            candidate.score,
+            candidate.signature(),
+        ),
+        reverse=True,
+    )
+
+
 def _results_screen(results: List[Candidate]) -> None:
     """Numbered result picker with arrow/number navigation."""
+    results = _ordered(results)
     while True:
         labels = []
         for candidate in results:
-            preview = candidate.text.replace("\n", " ").strip()
-            if len(preview) > 48:
-                preview = preview[:45] + "..."
+            preview = present.preview_text(candidate.text)
             name = present.display_name(candidate.method, candidate.params)
             level, _ = present.confidence(candidate)
             labels.append(f"{preview}   [{name} · {level}]")
@@ -227,7 +374,7 @@ def _results_screen(results: List[Candidate]) -> None:
         ]
         action = menu("What next?", actions)
         if action == 0:
-            results = _search(candidate.text, "", quiet=True)
+            results = _ordered(_search(candidate.text, "", quiet=True))
             if not results:
                 print("  Nothing further could be decoded from that.")
                 return
@@ -260,14 +407,21 @@ def _search(text: str, key: str, quiet: bool = False) -> List[Candidate]:
         text,
         max_depth=3,
         top=6,
-        wordlist=[] if key else load_wordlist(),
+        wordlist=[] if key else load_common_wordlist(),
         passphrase=key or None,
         openssl_progress=OpenSSLScanStatus(stream=sys.stdout, prefix="  "),
     )
     for candidate in found:
         if all(candidate.text != existing.text for existing in results):
             results.append(candidate)
-    results.sort(key=lambda c: c.score, reverse=True)
+    results.sort(
+        key=lambda candidate: (
+            candidate.verified,
+            candidate.score,
+            candidate.signature(),
+        ),
+        reverse=True,
+    )
     return results
 
 
