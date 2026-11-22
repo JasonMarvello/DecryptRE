@@ -197,7 +197,7 @@ def test_cli_shows_method_params_and_plain_language_confidence(capsys):
     out = capsys.readouterr().out
     assert "AES-256-GCM" in out
     assert f'passphrase "{PASSPHRASE}"' in out
-    assert "confidence: high" in out
+    assert "confidence: verified" in out
     assert MESSAGE in out
 
 

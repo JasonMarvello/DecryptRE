@@ -55,6 +55,26 @@ except ImportError:  # pragma: no cover - cryptography is a declared dependency
 MAGIC = b"Salted__"
 SALT_SIZE = 8
 PBKDF2_ITERATIONS = 10_000
+# An OpenSSL blob does not record the digest or PBKDF2 iteration count, so a
+# known passphrase is tried against the digests and cost settings `openssl
+# enc` commonly uses.  Bulk guessing stays on MD5/SHA-256 for speed (those
+# are the OpenSSL defaults across versions).
+LEGACY_GUESS_DIGESTS = ("md5", "sha256")
+KNOWN_LEGACY_DIGESTS = ("md5", "sha256", "sha1", "sha512", "sha224", "sha384")
+PBKDF2_GUESS_DIGESTS = ("sha256", "sha1", "sha512")
+PBKDF2_ITERATION_GUESSES = (10_000, 100_000)
+_DIGEST_LABELS = {
+    "md5": "MD5",
+    "sha1": "SHA-1",
+    "sha224": "SHA-224",
+    "sha256": "SHA-256",
+    "sha384": "SHA-384",
+    "sha512": "SHA-512",
+}
+
+
+def _digest_label(digest: str) -> str:
+    return _DIGEST_LABELS.get(digest, digest.upper())
 PARALLEL_MIN_PASSPHRASES = 1000
 PARALLEL_CHUNK_SIZE = 500
 MAX_DEFAULT_WORKERS = 8
@@ -222,6 +242,10 @@ def _plaintext(data: bytes) -> Optional[str]:
     except UnicodeDecodeError:
         return None
     if not text:
+        return None
+    # A stream cipher can turn a one-byte body into any character; a single
+    # printable byte is too weak to call a successful OpenSSL decryption.
+    if len(text) < 2:
         return None
     if any(ord(ch) < 32 and ch not in "\r\n\t" for ch in text):
         return None
@@ -442,29 +466,51 @@ def try_decrypt(token_text: str, passphrase: str) -> Optional[Tuple[str, str]]:
     except OpenSSLError:
         return None
     password = passphrase.encode("utf-8")
+    material_length = max(
+        (spec.key_length + spec.iv_length for spec in _CIPHERS), default=0
+    )
 
-    for digest in ("md5", "sha256"):
+    for digest in KNOWN_LEGACY_DIGESTS:
+        material = _evp_material(password, salt, material_length, digest)
         for spec in _CIPHERS:
             if not _fits(body, spec):
                 continue
-            key, iv = evp_bytes_to_key(
-                password, salt, spec.key_length, spec.iv_length, digest
-            )
+            key = material[:spec.key_length]
+            iv = material[
+                spec.key_length:spec.key_length + spec.iv_length
+            ]
             hit = _decrypt_with(
-                body, key, iv, f"OpenSSL {spec.label} ({digest.upper()})", spec
+                body,
+                key,
+                iv,
+                f"OpenSSL {spec.label} ({_digest_label(digest)})",
+                spec,
             )
             if hit:
                 return hit
 
-    for spec in _CIPHERS:
-        if not _fits(body, spec):
-            continue
-        key, iv = _pbkdf2_key(password, salt, spec.key_length, spec.iv_length)
-        hit = _decrypt_with(
-            body, key, iv, f"OpenSSL {spec.label} (PBKDF2-SHA256)", spec
-        )
-        if hit:
-            return hit
+    # PBKDF2 blobs do not store the iteration count or digest either. Try the
+    # OpenSSL default first, then the count used by common guides. Keeping
+    # this list short matters: every wrong passphrase pays for all of it.
+    for iterations in PBKDF2_ITERATION_GUESSES:
+        for digest in PBKDF2_GUESS_DIGESTS:
+            material = hashlib.pbkdf2_hmac(
+                digest, password, salt, iterations, material_length
+            )
+            for spec in _CIPHERS:
+                if not _fits(body, spec):
+                    continue
+                key = material[:spec.key_length]
+                iv = material[
+                    spec.key_length:spec.key_length + spec.iv_length
+                ]
+                label = (
+                    f"OpenSSL {spec.label} "
+                    f"(PBKDF2-{_digest_label(digest)}, {iterations} iterations)"
+                )
+                hit = _decrypt_with(body, key, iv, label, spec)
+                if hit:
+                    return hit
     return None
 
 
@@ -594,8 +640,8 @@ def dictionary_attack(
     # a stream cipher with no padding or tag, so a wrong key produces
     # printable-looking output often enough to make wordlist hits meaningless.
     # It remains available with an explicit --key.
-    for digest in ("md5", "sha256"):
-        label = "MD5" if digest == "md5" else "SHA-256"
+    for digest in LEGACY_GUESS_DIGESTS:
+        label = _digest_label(digest)
         if progress:
             progress(0, total, label)
         for index, password in enumerate(passwords, 1):

@@ -226,8 +226,9 @@ Auto mode peels one layer at a time:
 2. Try the classical cipher breakers.
 3. Try XOR when the text is binary or just came out of an encoding.
 4. Try a supplied passphrase against DecryptRE containers and OpenSSL
-   `Salted__` blobs; the cipher verifies it, so the result is marked high
-   confidence.
+   `Salted__` blobs. Fernet and AES-GCM are authenticated, so they are
+   reported as `verified`. OpenSSL and CBC padding hits carry no tag, so
+   they are reported as `high (unauthenticated)`.
 5. Otherwise try the passphrase dictionary on those containers and blobs. A
    short progress line reports the scan so a long one does not look frozen.
    Auto mode never starts `--incremental`; that mode requires an explicit
@@ -252,7 +253,9 @@ they are printed best-first so you can choose:
 
 Each result names the method, the recovered key or parameters, the path
 that produced it, and a plain-language confidence note. Passphrase results
-verified by the cipher are always listed first and say so. `--verbose` adds
+are always listed first. `verified` means a real authentication tag proved
+the key; `high (unauthenticated)` means valid padding plus readable text,
+which is a strong guess rather than proof. `--verbose` adds
 the raw score and search depth; the score is a ranking aid, not a
 probability.
 

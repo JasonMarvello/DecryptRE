@@ -5,6 +5,7 @@ derivation, passphrase ``123``, plaintext ``hello``.
 """
 
 import base64
+import hashlib
 
 import pytest
 from Crypto.Cipher import AES, ARC4, DES, DES3
@@ -50,6 +51,8 @@ def encrypt_openssl(text, passphrase, cipher="aes-256-cbc", digest="md5"):
         ("des3-cbc", "md5"),
         ("des-cbc", "sha256"),
         ("rc4", "md5"),
+        ("aes-256-cbc", "sha1"),
+        ("aes-256-cbc", "sha512"),
     ],
 )
 def test_openssl_roundtrip(cipher, digest):
@@ -75,6 +78,34 @@ def test_wrong_passphrase_is_rejected():
     assert openssl_compat.try_decrypt(USER_BLOB, "124") is None
 
 
+def _pbkdf2_blob(text, passphrase, digest="sha256", iterations=10_000):
+    salt = b"12345678"
+    material = hashlib.pbkdf2_hmac(
+        digest, passphrase.encode(), salt, iterations, 48
+    )
+    body = AES.new(material[:32], AES.MODE_CBC, material[32:]).encrypt(
+        pad(text.encode(), 16)
+    )
+    return base64.b64encode(b"Salted__" + salt + body).decode("ascii")
+
+
+@pytest.mark.parametrize(
+    "digest,iterations",
+    [
+        ("sha256", 10_000),
+        ("sha256", 100_000),
+        ("sha1", 10_000),
+        ("sha512", 10_000),
+    ],
+)
+def test_pbkdf2_variants_open_with_the_right_passphrase(digest, iterations):
+    blob = _pbkdf2_blob(MESSAGE, PASSPHRASE, digest, iterations)
+    hit = openssl_compat.try_decrypt(blob, PASSPHRASE)
+    assert hit is not None
+    assert hit[0] == MESSAGE
+    assert "PBKDF2" in hit[1]
+
+
 def test_auto_with_passphrase_marks_verified():
     results = auto_detect.detect(USER_BLOB, top=1, passphrase="123")
     assert results[0].text == "hello"
@@ -97,7 +128,7 @@ def test_cli_explicit_method(capsys):
     out = capsys.readouterr().out
     assert "hello" in out
     assert "OpenSSL" in out
-    assert "confidence: high" in out
+    assert "confidence: high (unauthenticated)" in out
 
 
 def test_cli_auto_with_key(capsys):

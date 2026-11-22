@@ -189,6 +189,55 @@ METHODS: List[Dict[str, Any]] = [
 ]
 
 
+AUTHENTICATED_ALGS = frozenset({"fernet", "aes-gcm"})
+
+
+def is_authenticated(candidate) -> bool:
+    """True only when a real authentication tag proved the passphrase.
+
+    OpenSSL ``Salted__`` blobs and the CBC container modes only prove valid
+    padding plus readable text. They remain ``verified=True`` internally so
+    ranking and callers do not change, but the UI must not present them as
+    cryptographically proven.
+    """
+    if not candidate.verified:
+        return False
+    if candidate.method == "openssl":
+        return False
+    if candidate.method == "modern":
+        return candidate.params.get("alg") in AUTHENTICATED_ALGS
+    return True
+
+
+def visible_controls(text: str) -> str:
+    """Escape control characters while keeping real newlines and tabs."""
+    return "".join(
+        ch if ch in "\n\t" or ch.isprintable() else f"\\x{ord(ch):02x}"
+        for ch in text
+    )
+
+
+def preview_text(text: str, limit: int = 48) -> str:
+    """Collapse text to one safe, single-line display string.
+
+    Real line breaks and tabs become spaces. Other control characters are
+    shown as ``\\xNN`` so they cannot move the cursor or corrupt the layout.
+    Literal backslash sequences in the plaintext stay literal.
+    """
+    characters = []
+    for ch in text:
+        if ch in "\r\n\t":
+            characters.append(" ")
+        elif ch.isprintable():
+            characters.append(ch)
+        else:
+            characters.append(f"\\x{ord(ch):02x}")
+    flat = " ".join("".join(characters).split())
+    if len(flat) > limit:
+        flat = flat[: max(0, limit - 3)].rstrip() + "..."
+    return flat
+
+
 def display_name(method: str, params: Dict[str, Any] = None) -> str:
     """Human name for a candidate, including the concrete algorithm."""
     if method == "modern":
@@ -232,15 +281,23 @@ def describe_params(method: str, params: Dict[str, Any]) -> str:
 def confidence(candidate) -> Tuple[str, str]:
     """Return ``(label, explanation)`` for a candidate's trustworthiness."""
     if candidate.verified:
-        if candidate.method == "openssl":
-            return (
-                "high",
-                "the passphrase produced valid padding and readable UTF-8 "
-                "(OpenSSL blobs carry no authentication tag).",
-            )
+        if not is_authenticated(candidate):
+            if candidate.method == "openssl":
+                note = (
+                    "valid padding and readable UTF-8, but OpenSSL 'Salted__' "
+                    "blobs carry no authentication tag; treat this as a strong "
+                    "guess, not proof."
+                )
+            else:
+                note = (
+                    "valid padding and readable UTF-8, but this cipher mode has "
+                    "no authentication tag; treat this as a strong guess, not "
+                    "proof."
+                )
+            return ("high (unauthenticated)", note)
         return (
-            "high",
-            "the passphrase was verified by the cipher itself (authentication tag).",
+            "verified",
+            "the cipher's authentication tag proved the passphrase.",
         )
     text = candidate.text or ""
     has_ascii_letters = any("a" <= ch.lower() <= "z" for ch in text)

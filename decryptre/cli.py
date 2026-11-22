@@ -90,12 +90,19 @@ def read_input(value: str) -> str:
     return value
 
 
-def load_wordlist(path: Optional[str] = None) -> List[str]:
-    """Load a newline-separated passphrase list (bundled by default)."""
-    if path is None:
-        candidate = Path(__file__).parent / "wordlists" / "common-passwords.txt"
-    else:
-        candidate = Path(path)
+WORDLIST_DIR = Path(__file__).parent / "wordlists"
+COMMON_WORDLIST = WORDLIST_DIR / "common-passwords.txt"
+BUNDLED_DICTIONARIES = (
+    "dictionary-english.txt",
+    "dictionary-indonesian.txt",
+    "dictionary-hindi.txt",
+    "dictionary-russian.txt",
+    "dictionary-ukrainian.txt",
+)
+
+
+def _read_wordlist(candidate: Path) -> List[str]:
+    """Read one newline-separated list, ignoring blanks and comments."""
     if not candidate.is_file():
         raise SystemExit(f"error: wordlist not found: {candidate}")
     words = []
@@ -106,12 +113,32 @@ def load_wordlist(path: Optional[str] = None) -> List[str]:
     return words
 
 
+def load_common_wordlist() -> List[str]:
+    """The small, fast list used by auto mode and modern-crypto scans."""
+    return _read_wordlist(COMMON_WORDLIST)
+
+
+def load_wordlist(path: Optional[str] = None) -> List[str]:
+    """Load a passphrase list.
+
+    A user-supplied ``path`` replaces the bundled lists.  The bundled default
+    is the 10,000 common passwords followed by the multilingual dictionaries
+    (English US/UK, Indonesian, Hindi, Russian, Ukrainian), which is used for
+    explicit OpenSSL scans.
+    """
+    if path is not None:
+        return _read_wordlist(Path(path))
+    words = load_common_wordlist()
+    for name in BUNDLED_DICTIONARIES:
+        candidate = WORDLIST_DIR / name
+        if candidate.is_file():
+            words.extend(_read_wordlist(candidate))
+    return words
+
+
 def _display(text: str) -> str:
     """Make control characters visible without hiding readable Unicode."""
-    return "".join(
-        ch if ch in "\n\t" or ch.isprintable() else f"\\x{ord(ch):02x}"
-        for ch in text
-    )
+    return present.visible_controls(text)
 
 
 _B64_SHAPE = re.compile(r"^[A-Za-z0-9+/=_-]+$")
@@ -180,7 +207,8 @@ def _format_hint(text: str, had_key: bool) -> Optional[str]:
             message = (
                 "This is an OpenSSL 'Salted__' blob (openssl enc ...). Pass the "
                 f"passphrase with --key. Auto mode tries {_cipher_names()} with "
-                "OpenSSL's MD5, SHA-256 and PBKDF2 key derivation."
+                "OpenSSL's MD5, SHA-1, SHA-256, SHA-512 and PBKDF2 key "
+                "derivation (common iteration counts)."
             )
         return textwrap.fill(message, width=78)
     return _binary_container_hint(text)
@@ -617,7 +645,14 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
 
     if method in ("fernet", "aes", "des3"):
         if not args.key:
-            words = [] if args.no_wordlist else load_wordlist(args.wordlist)
+            if args.no_wordlist:
+                words = []
+            elif args.wordlist:
+                words = load_wordlist(args.wordlist)
+            else:
+                # Modern containers use a real iterated KDF: the full
+                # dictionary would turn a scan into hours, so stay small.
+                words = load_common_wordlist()
             if not words:
                 raise SystemExit("error: modern crypto needs --key (no wordlist loaded)")
             results = modern_crypto.dictionary_attack(text, words, top=args.top)
@@ -681,12 +716,15 @@ def cmd_decrypt(args) -> int:
 
     if method == "auto":
         # A known passphrase disables the dictionary: the cipher verifies the
-        # key, so trying 10,000 wrong ones would only waste time.
-        words = (
-            []
-            if args.key or args.no_wordlist
-            else load_wordlist(args.wordlist)
-        )
+        # key, so trying thousands of wrong ones would only waste time.  Auto
+        # mode also stays on the short common-password list; the full
+        # multilingual dictionary is for an explicit `--method openssl` scan.
+        if args.key or args.no_wordlist:
+            words = []
+        elif args.wordlist:
+            words = load_wordlist(args.wordlist)
+        else:
+            words = load_common_wordlist()
         results = detect(
             text,
             max_depth=args.max_depth,
@@ -895,12 +933,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     decrypt.add_argument(
         "--wordlist",
-        help="file of passphrases to try, one per line (replaces the bundled list)",
+        help=(
+            "file of passphrases to try, one per line (replaces the bundled "
+            "lists)"
+        ),
     )
     decrypt.add_argument(
         "--no-wordlist",
         action="store_true",
-        help="do not try the bundled 10,000-passphrase list (faster)",
+        help="do not try the bundled word lists (faster)",
     )
     decrypt.add_argument(
         "--workers",

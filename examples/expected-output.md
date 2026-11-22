@@ -62,7 +62,7 @@ decryptre decrypt --input examples/fernet.txt --method fernet --key sunshine
 ```
 
 ```text
-[1] Fernet  ·  confidence: high
+[1] Fernet  ·  confidence: verified
     the passphrase was verified by the cipher itself (authentication tag).
     This message was protected with a passphrase from the wordlist.
 ```
@@ -80,7 +80,7 @@ decryptre decrypt --input examples/aes.txt --method aes --key sunshine
 ```
 
 ```text
-[1] AES-256-GCM  ·  confidence: high
+[1] AES-256-GCM  ·  confidence: verified
     the passphrase was verified by the cipher itself (authentication tag).
     This message was protected with a passphrase from the wordlist.
 ```
