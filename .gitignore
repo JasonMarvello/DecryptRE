@@ -35,3 +35,8 @@ Thumbs.db
 # Local scratch files
 *.log
 tmp/
+
+# Optional large wordlist tier, built locally and never packaged
+decryptre/wordlists/rockyou-large.txt.gz
+decryptre/wordlists/rockyou-large.json
+decryptre/wordlists/*.tmp

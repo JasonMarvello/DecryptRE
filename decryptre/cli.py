@@ -18,6 +18,7 @@ from . import (
     modern_crypto,
     openssl_compat,
     present,
+    wordlist as wordlists,
     xor,
 )
 from .auto_detect import XOR_PREFIX, detect
@@ -90,50 +91,39 @@ def read_input(value: str) -> str:
     return value
 
 
-WORDLIST_DIR = Path(__file__).parent / "wordlists"
-COMMON_WORDLIST = WORDLIST_DIR / "common-passwords.txt"
-BUNDLED_DICTIONARIES = (
-    "dictionary-english.txt",
-    "dictionary-indonesian.txt",
-    "dictionary-hindi.txt",
-    "dictionary-russian.txt",
-    "dictionary-ukrainian.txt",
-)
-
-
 def _read_wordlist(candidate: Path) -> List[str]:
     """Read one newline-separated list, ignoring blanks and comments."""
-    if not candidate.is_file():
-        raise SystemExit(f"error: wordlist not found: {candidate}")
-    words = []
-    for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            words.append(line)
-    return words
+    try:
+        return [
+            line.decode("utf-8", "replace")
+            for line in wordlists.iter_file(candidate)
+        ]
+    except wordlists.WordlistError as exc:
+        raise SystemExit(f"error: {exc}") from exc
 
 
 def load_common_wordlist() -> List[str]:
     """The small, fast list used by auto mode and modern-crypto scans."""
-    return _read_wordlist(COMMON_WORDLIST)
+    return [
+        line.decode("utf-8", "replace")
+        for line in wordlists.iter_tier("small")
+    ]
 
 
 def load_wordlist(path: Optional[str] = None) -> List[str]:
-    """Load a passphrase list.
+    """Load a passphrase list for callers that need it in memory.
 
-    A user-supplied ``path`` replaces the bundled lists.  The bundled default
-    is the 10,000 common passwords followed by the multilingual dictionaries
-    (English US/UK, Indonesian, Hindi, Russian, Ukrainian), which is used for
-    explicit OpenSSL scans.
+    A user-supplied ``path`` replaces the bundled lists. The bundled default is
+    the medium tier: 10,000 common passwords plus the multilingual
+    dictionaries. Explicit OpenSSL scans stream this tier instead of calling
+    this function.
     """
     if path is not None:
         return _read_wordlist(Path(path))
-    words = load_common_wordlist()
-    for name in BUNDLED_DICTIONARIES:
-        candidate = WORDLIST_DIR / name
-        if candidate.is_file():
-            words.extend(_read_wordlist(candidate))
-    return words
+    return [
+        line.decode("utf-8", "replace")
+        for line in wordlists.iter_tier("medium")
+    ]
 
 
 def _display(text: str) -> str:
@@ -603,8 +593,22 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
         if args.incremental:
             return _incremental_decrypt(text, args)
         if not args.key:
-            words = [] if args.no_wordlist else load_wordlist(args.wordlist)
-            if not words:
+            if args.no_wordlist:
+                raise SystemExit(
+                    "error: OpenSSL blobs need --key (no wordlist loaded)"
+                )
+            try:
+                if args.wordlist:
+                    source = Path(args.wordlist)
+                    total = wordlists.count_file(source)
+                    factory = lambda: wordlists.iter_file(source)
+                else:
+                    tier = args.wordlist_tier or "medium"
+                    total = wordlists.tier_count(tier)
+                    factory = lambda: wordlists.iter_tier(tier)
+            except wordlists.WordlistError as exc:
+                raise SystemExit(f"error: {exc}") from exc
+            if not total:
                 raise SystemExit(
                     "error: OpenSSL blobs need --key (no wordlist loaded)"
                 )
@@ -613,9 +617,10 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
                 if args.workers is not None
                 else openssl_compat.default_workers()
             )
-            results = openssl_compat.dictionary_attack(
+            results = openssl_compat.dictionary_attack_stream(
                 text,
-                words,
+                factory,
+                total,
                 top=args.top,
                 progress=OpenSSLScanStatus(),
                 workers=workers,
@@ -687,6 +692,28 @@ def cmd_decrypt(args) -> int:
         if method != "openssl":
             raise SystemExit(
                 "error: --workers only applies to --method openssl"
+            )
+
+    if args.wordlist and args.wordlist_tier:
+        raise SystemExit(
+            "error: --wordlist and --wordlist-tier are mutually exclusive"
+        )
+    if args.wordlist_tier:
+        if method != "openssl":
+            raise SystemExit(
+                "error: --wordlist-tier only applies to --method openssl"
+            )
+        if args.key:
+            raise SystemExit(
+                "error: --wordlist-tier cannot be combined with --key"
+            )
+        if args.incremental:
+            raise SystemExit(
+                "error: --wordlist-tier cannot be combined with --incremental"
+            )
+        if args.no_wordlist:
+            raise SystemExit(
+                "error: --wordlist-tier cannot be combined with --no-wordlist"
             )
 
     if args.incremental:
@@ -936,6 +963,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "file of passphrases to try, one per line (replaces the bundled "
             "lists)"
+        ),
+    )
+    decrypt.add_argument(
+        "--wordlist-tier",
+        choices=("small", "medium", "large"),
+        default=None,
+        help=(
+            "bundled list size for explicit --method openssl scans: small "
+            "(10,000), medium (1.37M, default) or large (medium + a locally "
+            "built RockYou tier). Not shipped with PyPI."
         ),
     )
     decrypt.add_argument(

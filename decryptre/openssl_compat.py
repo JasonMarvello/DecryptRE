@@ -19,8 +19,9 @@ import concurrent.futures as futures
 import hashlib
 import multiprocessing
 import os
+from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Iterable, Iterator, List, Optional, Tuple, Union
 
 from Crypto.Cipher import AES, ARC4, DES, DES3
 from Crypto.Util.Padding import unpad
@@ -514,122 +515,131 @@ def try_decrypt(token_text: str, passphrase: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _as_passphrase_bytes(word: Union[str, bytes]) -> bytes:
+    """Keep wordlist entries as bytes; decode only for display."""
+    return word if isinstance(word, bytes) else word.encode("utf-8")
+
+
+def _iter_chunks(
+    wordlist: Iterable[Union[str, bytes]],
+    size: int = PARALLEL_CHUNK_SIZE,
+) -> Iterator[List[bytes]]:
+    """Group a stream into bounded chunks without materialising it."""
+    chunk: List[bytes] = []
+    for word in wordlist:
+        password = _as_passphrase_bytes(word)
+        if not password:
+            continue
+        chunk.append(password)
+        if len(chunk) >= size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+def _dictionary_candidate(
+    password: bytes, plain: str, alg: str, top: int
+) -> List[Candidate]:
+    return [
+        Candidate(
+            plain,
+            "openssl",
+            {
+                "alg": alg,
+                "passphrase": password.decode("utf-8", "replace"),
+            },
+            score_text(plain),
+            verified=True,
+        )
+    ][:top]
+
+
 def _dictionary_attack_parallel(
     token_text: str,
-    passwords: List[bytes],
+    wordlist_factory: Callable[[], Iterable[Union[str, bytes]]],
     total: int,
     top: int,
     progress: Optional[Callable[[int, int, str], None]],
     workers: int,
 ) -> List[Candidate]:
-    """Run digest phases over ordered chunks in spawned worker processes."""
-    chunks = [
-        passwords[start:start + PARALLEL_CHUNK_SIZE]
-        for start in range(0, total, PARALLEL_CHUNK_SIZE)
-    ]
-    starts = list(range(0, total, PARALLEL_CHUNK_SIZE))
+    """Run digest phases over a streamed wordlist in spawned workers.
+
+    Only a few chunks are in flight at once. The parent consumes results in
+    order so the earliest wordlist hit is returned, while a shared stop marker
+    tells workers after the hit to abandon their chunks.
+    """
     context = multiprocessing.get_context("spawn")
     stop = context.Value("i", -1)
     executor = futures.ProcessPoolExecutor(
-        max_workers=min(workers, len(chunks)),
+        max_workers=max(1, workers),
         mp_context=context,
         initializer=_parallel_worker_init,
         initargs=(token_text, stop),
     )
-    jobs = []
+    pending = deque()
     try:
         for digest, label in (("md5", "MD5"), ("sha256", "SHA-256")):
             stop.value = -1
+            pending.clear()
             if progress:
                 progress(0, total, label)
-            jobs = [
-                executor.submit(
-                    _dictionary_parallel_worker,
-                    (digest, index, chunk),
-                )
-                for index, chunk in enumerate(chunks)
-            ]
+            stream = _iter_chunks(wordlist_factory())
+            next_index = 0
             done = 0
-            for index, (job, chunk) in enumerate(zip(jobs, chunks)):
+
+            def submit_one() -> bool:
+                nonlocal next_index
+                try:
+                    chunk = next(stream)
+                except StopIteration:
+                    return False
+                job = executor.submit(
+                    _dictionary_parallel_worker,
+                    (digest, next_index, chunk),
+                )
+                pending.append((next_index, len(chunk), job))
+                next_index += 1
+                return True
+
+            for _ in range(max(1, workers * 2)):
+                if not submit_one():
+                    break
+
+            while pending:
+                _chunk_index, size, job = pending.popleft()
                 result = job.result()
                 if result is None:
-                    done += len(chunk)
+                    done += size
                     if progress:
                         progress(min(done, total), total, label)
+                    submit_one()
                     continue
 
-                hit_chunk, offset, password, plain, alg = result
+                _hit_chunk, offset, password, plain, alg = result
                 if progress:
-                    progress(
-                        min(starts[hit_chunk] + offset + 1, total),
-                        total,
-                        label,
-                    )
-                for later in jobs[index + 1:]:
+                    progress(min(done + offset + 1, total), total, label)
+                for _index, _size, later in pending:
                     later.cancel()
-                return [
-                    Candidate(
-                        plain,
-                        "openssl",
-                        {
-                            "alg": alg,
-                            "passphrase": password.decode("utf-8", "replace"),
-                        },
-                        score_text(plain),
-                        verified=True,
-                    )
-                ][:top]
+                return _dictionary_candidate(password, plain, alg, top)
     except BaseException:
         stop.value = -2
         raise
     finally:
-        for job in jobs:
+        for _index, _size, job in pending:
             job.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
     return []
 
 
-def dictionary_attack(
-    token_text: str,
-    wordlist: Iterable[str],
-    top: int = 2,
-    progress: Optional[Callable[[int, int, str], None]] = None,
-    workers: int = 1,
+def _dictionary_attack_serial(
+    salt: bytes,
+    body: bytes,
+    wordlist_factory: Callable[[], Iterable[Union[str, bytes]]],
+    total: int,
+    top: int,
+    progress: Optional[Callable[[int, int, str], None]],
 ) -> List[Candidate]:
-    """Try a wordlist against an OpenSSL salted blob.
-
-    The legacy KDF is cheap (no iteration count), so a bundled wordlist is
-    practical here. The PBKDF2 variant is not wordlisted: at 10,000 iterations
-    per guess it would turn seconds into minutes, so `--key` is required for
-    those blobs.
-
-    ``progress`` is called as ``progress(done, total, digest)`` while the scan
-    runs, so a caller can show that work is happening instead of looking
-    frozen.
-    """
-    try:
-        salt, body = _split(token_text)
-    except OpenSSLError:
-        return []
-
-    found: List[Candidate] = []
-    seen = set()
-    passwords = []
-    for word in wordlist:
-        word = word.strip()
-        if word and word not in seen:
-            seen.add(word)
-            passwords.append(word.encode("utf-8"))
-    if not passwords:
-        return []
-
-    total = len(passwords)
-    workers = max(1, workers)
-    if workers > 1 and total >= PARALLEL_MIN_PASSPHRASES:
-        return _dictionary_attack_parallel(
-            token_text, passwords, total, top, progress, workers
-        )
-
     step = max(1, total // 20)
     candidates = _legacy_ciphers(body)
     material_length = max(
@@ -644,7 +654,10 @@ def dictionary_attack(
         label = _digest_label(digest)
         if progress:
             progress(0, total, label)
-        for index, password in enumerate(passwords, 1):
+        for index, word in enumerate(wordlist_factory(), 1):
+            password = _as_passphrase_bytes(word)
+            if not password:
+                continue
             material = _evp_material(
                 password, salt, material_length, digest
             )
@@ -662,22 +675,72 @@ def dictionary_attack(
                 )
                 if hit:
                     plain, alg = hit
-                    found.append(
-                        Candidate(
-                            plain,
-                            "openssl",
-                            {
-                                "alg": alg,
-                                "passphrase": password.decode("utf-8", "replace"),
-                            },
-                            score_text(plain),
-                            verified=True,
-                        )
-                    )
                     if progress:
-                        progress(index, total, label)
-                    return found[:top]
+                        progress(min(index, total), total, label)
+                    return _dictionary_candidate(password, plain, alg, top)
             if progress and (index % step == 0 or index == total):
-                progress(index, total, label)
+                progress(min(index, total), total, label)
+    return []
 
-    return found
+
+def dictionary_attack_stream(
+    token_text: str,
+    wordlist_factory: Callable[[], Iterable[Union[str, bytes]]],
+    total: int,
+    top: int = 2,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+    workers: int = 1,
+) -> List[Candidate]:
+    """Try a streamed wordlist against an OpenSSL salted blob.
+
+    ``wordlist_factory`` is called once per KDF phase, so tiered files are
+    reopened instead of kept in memory. ``total`` is the number of candidates
+    from the manifest (or a counted custom file) and is used for progress.
+    """
+    try:
+        salt, body = _split(token_text)
+    except OpenSSLError:
+        return []
+    if total <= 0:
+        return []
+    workers = max(1, workers)
+    if workers > 1 and total >= PARALLEL_MIN_PASSPHRASES:
+        return _dictionary_attack_parallel(
+            token_text, wordlist_factory, total, top, progress, workers
+        )
+    return _dictionary_attack_serial(
+        salt, body, wordlist_factory, total, top, progress
+    )
+
+
+def dictionary_attack(
+    token_text: str,
+    wordlist: Iterable[Union[str, bytes]],
+    top: int = 2,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+    workers: int = 1,
+) -> List[Candidate]:
+    """Try an in-memory wordlist against an OpenSSL salted blob.
+
+    This compatibility wrapper de-duplicates an arbitrary iterable. The CLI
+    uses :func:`dictionary_attack_stream` so bundled lists never accumulate in
+    memory.
+    """
+    seen = set()
+    passwords: List[bytes] = []
+    for word in wordlist:
+        password = _as_passphrase_bytes(word).strip()
+        if password and password not in seen:
+            seen.add(password)
+            passwords.append(password)
+    if not passwords:
+        return []
+    frozen = tuple(passwords)
+    return dictionary_attack_stream(
+        token_text,
+        lambda: iter(frozen),
+        len(frozen),
+        top=top,
+        progress=progress,
+        workers=workers,
+    )

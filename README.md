@@ -147,7 +147,8 @@ decryptre decrypt --input <file|text|-> [options]
 | `--key TEXT` | none | Passphrase or cipher key. In auto mode a passphrase is also tried against AES/Fernet/3DES containers and verified by the cipher. |
 | `--shift N` | try all | Caesar shift. |
 | `--rails N` | try 2-12 | Rail Fence rails. |
-| `--wordlist PATH` | bundled list | Passphrase list for Fernet/AES/3DES. |
+| `--wordlist PATH` | bundled list | Passphrase list for Fernet/AES/3DES. Replaces the bundled tiers. |
+| `--wordlist-tier small\|medium\|large` | `medium` | Bundled list size for explicit `--method openssl`: 10k, 1.37M, or medium plus a locally built RockYou tier. `large` is not shipped on PyPI. |
 | `--no-wordlist` | off | Skip the bundled wordlist. |
 | `--workers N` | CPU count, capped at 8 | Worker processes for explicit `--method openssl` wordlist and incremental scans. `--workers 1` disables; auto mode stays single-process. |
 | `--incremental` | off | Opt-in exhaustive passphrase search for OpenSSL `Salted__` blobs. Requires `--method openssl`; auto mode never starts it. See [Incremental search](#incremental-search-opt-in-exhaustive-passphrase-search). |
@@ -311,14 +312,59 @@ decryptre decrypt --input examples/fernet.txt --method fernet --key sunshine
 
 ## Wordlists
 
-The bundled `decryptre/wordlists/common-passwords.txt` is the 10,000 most
-common passwords list from [SecLists](https://github.com/danielmiessler/SecLists)
-(MIT). Provenance and license are documented in
+Bundled wordlists are split into tiers. The files are streamed line by line as
+raw bytes, so a scan does not load a multi-million-line list into memory or
+duplicate it across worker processes. Counts and file order come from
+[`decryptre/wordlists/manifest.json`](decryptre/wordlists/manifest.json); the
+medium tier is globally deduplicated at build time.
+
+| Tier | Candidates | Used by | Shipped on PyPI |
+| --- | ---: | --- | --- |
+| `small` | 10,001 | Auto mode and modern-container scans; optional for explicit OpenSSL | yes |
+| `medium` | 1,368,353 | Default for explicit `--method openssl` | yes |
+| `large` | medium + local RockYou | Optional local build for explicit `--method openssl` | **no** |
+
+Provenance and licenses for the shipped lists are in
 [`decryptre/wordlists/SOURCE.md`](decryptre/wordlists/SOURCE.md).
 
-Use your own list with `--wordlist path/to/list.txt` (one candidate per line;
-blank lines and `#` comments are ignored), or skip the bundled one with
-`--no-wordlist`. A longer list means more KDF work, so it is slower.
+```bash
+# Fast 10k scan, or the default 1.37M multilingual scan.
+decryptre decrypt --input blob.txt --method openssl --wordlist-tier small
+decryptre decrypt --input blob.txt --method openssl
+
+# Replace the tiers with your own list.
+decryptre decrypt --input blob.txt --method openssl --wordlist my-words.txt
+```
+
+`--wordlist` replaces the bundled tiers; `--wordlist-tier` cannot be combined
+with it, with `--key`, `--incremental`, or `--no-wordlist`. Auto mode stays on
+`small` and rejects the tier option, so an ordinary decode never turns into a
+multi-minute scan.
+
+### Optional local `large` tier (RockYou)
+
+RockYou is a 2009 breach corpus of about 14.3 million real passwords. It has
+**no explicit license** and contains other people's data, so DecryptRE does
+**not** ship it and `pip install decryptre` never downloads it. The `large`
+tier is an explicitly opt-in, local-only build for authorized testing.
+
+From a source checkout:
+
+```bash
+python tools/build_wordlists.py --fetch-rockyou
+```
+
+The script prints a provenance and ethics notice first and requires you to
+type `I understand` before it downloads anything (`--yes` skips the prompt in
+automation). It removes entries already in the medium tier and duplicates
+inside RockYou, then writes `decryptre/wordlists/rockyou-large.txt.gz` plus a
+local metadata file with the count and SHA-256. Both are ignored by Git and
+excluded from the package; delete them with
+`python tools/build_wordlists.py --remove-rockyou`. Without that local build,
+`--wordlist-tier large` prints the build command instead of failing obscurely.
+
+`python tools/build_wordlists.py --verify` checks the shipped tiers for
+duplicates; add `--write-manifest` to refresh the committed counts.
 
 The substitution solver uses aggregate English trigram statistics derived
 from a public-domain book; see
@@ -334,15 +380,38 @@ uses one worker process per available CPU (capped at 8) by default.
 `--workers 1` restores the single-process path, and any positive number
 overrides the default.
 
-Work is split into ordered 500-candidate chunks. Results are still consumed
-in the original order, so a dictionary hit or incremental hit is the same
-first readable result the serial scan would have found. Later chunks stop as
-soon as an earlier chunk reports a hit. Incremental checkpoints advance only
-over the contiguous completed prefix, so a resume never skips work that is
-still in flight.
+Work is split into ordered 500-candidate chunks. Dictionary chunks are read
+from the tier stream on demand, with only a few chunks in flight at once, so
+the parent process does not build a futures list for all 1.37M (or 15M local)
+candidates. Results are still consumed in the original order, so a dictionary
+hit or incremental hit is the same first readable result the serial scan
+would have found. Later chunks stop as soon as an earlier chunk reports a
+hit. Incremental checkpoints advance only over the contiguous completed
+prefix, so a resume never skips work that is still in flight.
 
 Auto mode and the modern AES/Fernet/3DES dictionary do not use this pool;
 `--workers` is rejected outside explicit OpenSSL scans.
+
+### Measured wordlist cost
+
+Measured on 2026-11-22 on a 2-core Linux cloud runner against an OpenSSL
+AES-256-CBC blob whose passphrase is absent from the list, so both KDF phases
+run to exhaustion. Times include process startup and streaming.
+
+| Tier | Candidates | 1 worker | 2 workers |
+| --- | ---: | ---: | ---: |
+| `small` | 10,001 | 3.45 s | 2.14 s |
+| `medium` | 1,368,353 | 7 m 37 s | 4 m 03 s |
+| `large` | 15,645,659 (medium + 14,277,306 local) | not full-scanned here | not full-scanned here |
+
+Peak resident memory was 31.5 MB for the serial medium scan and 35.6 MB for
+the two-worker scan, so the list is streamed rather than copied into every
+worker. Streaming all 15,645,659 large-tier candidates once, without scanning,
+took 7.2 s and 14.6 MB RSS. A large scan is a deliberate offline job: at the
+measured medium rate (5,688 candidates/s with two workers) it is roughly
+46 minutes on two cores, or around 92 minutes on one. That full 15M scan was
+not run on this 2-core runner; a 1M RockYou slice took 2 m 56 s (5,688
+candidates/s, 31.8 MB peak RSS), which is the basis for the projection.
 
 ## Incremental search (opt-in, exhaustive passphrase search)
 

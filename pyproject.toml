@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decryptre"
-version = "0.3.3"
+version = "0.4.0"
 description = "Offline, open-source CLI that decrypts text with or without a passphrase and re-encrypts it with the same methods."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -38,7 +38,13 @@ include = ["decryptre*"]
 namespaces = true
 
 [tool.setuptools.package-data]
-decryptre = ["wordlists/*.txt", "wordlists/*.md", "data/*.txt", "data/*.md"]
+decryptre = [
+    "wordlists/*.txt",
+    "wordlists/manifest.json",
+    "wordlists/*.md",
+    "data/*.txt",
+    "data/*.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

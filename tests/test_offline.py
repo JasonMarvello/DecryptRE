@@ -27,4 +27,5 @@ def test_package_has_no_network_imports():
 
 def test_bundled_data_is_present():
     assert (PACKAGE / "wordlists" / "common-passwords.txt").is_file()
+    assert (PACKAGE / "wordlists" / "manifest.json").is_file()
     assert (PACKAGE / "data" / "trigrams.txt").is_file()

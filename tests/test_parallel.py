@@ -80,6 +80,49 @@ def test_parallel_incremental_resumes_at_a_mid_length_position(tmp_path):
     assert state.passphrases_done == 153
 
 
+def test_streaming_parallel_scans_and_reopens_for_both_digests():
+    calls = []
+
+    def factory():
+        calls.append(True)
+        return (f"nope-{index}" for index in range(1200))
+
+    blob = _aes_blob("not-in-the-list")
+    result = openssl_compat.dictionary_attack_stream(
+        blob, factory, 1200, workers=2
+    )
+
+    assert result == []
+    assert len(calls) == 2  # MD5 phase, then SHA-256 phase
+
+
+def test_streaming_keeps_non_utf8_passphrase_bytes():
+    password = b"\xffsecret"
+    salt = b"12345678"
+    key, iv = openssl_compat.evp_bytes_to_key(password, salt, 32, 16, "md5")
+    body = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(MESSAGE.encode(), 16))
+    blob = base64.b64encode(b"Salted__" + salt + body).decode("ascii")
+
+    result = openssl_compat.dictionary_attack_stream(
+        blob, lambda: iter([password]), 1, workers=1
+    )
+
+    assert result
+    assert result[0].text == MESSAGE
+    assert result[0].params["passphrase"] == "\ufffdsecret"
+
+
+def test_chunking_is_bounded_and_preserves_order():
+    chunks = list(
+        openssl_compat._iter_chunks(
+            (str(index) for index in range(11)), size=4
+        )
+    )
+    assert [len(chunk) for chunk in chunks] == [4, 4, 3]
+    assert chunks[0][0] == b"0"
+    assert chunks[-1][-1] == b"10"
+
+
 def test_workers_flag_is_documented_and_validated(capsys):
     with pytest.raises(SystemExit):
         main(["decrypt", "--help"])
