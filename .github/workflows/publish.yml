@@ -1,4 +1,9 @@
-# Build the package and upload it to PyPI when a version tag (v*) is pushed.
+# Build the package and upload it to PyPI when a maintainer explicitly runs
+# this workflow from the Actions tab.
+#
+# This intentionally has no tag-push trigger: creating a GitHub release or
+# pushing v0.4.0 must not publish to PyPI as a side effect. To publish, choose
+# the release tag (or main) in Actions -> publish -> Run workflow.
 #
 # This uses PyPI "Trusted Publishing": GitHub proves its identity to PyPI with a
 # short-lived token, so there is no PyPI password or API key stored anywhere.
@@ -10,9 +15,6 @@
 name: publish
 
 on:
-  push:
-    tags: ["v*"]
-  # Lets you publish an already-tagged version from the Actions tab.
   workflow_dispatch:
 
 jobs:
