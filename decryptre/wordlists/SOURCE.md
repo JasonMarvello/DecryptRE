@@ -33,6 +33,13 @@ by modern-container scans, where the KDF makes every guess expensive.
 The file contains 10,001 non-empty entries as retrieved; blank lines and
 comments are not counted or yielded by the streaming loader.
 
+## Personal-name seeds
+
+`names.txt` is a small curated set of common given names and surnames used
+only as generation seeds for the optional `5m`/`10m`/`50m`/`100m` tiers. It is
+not a list of real people, is not tied to any individual, and does not assert
+copyright over common names. Examples include `Patty` and `Verenza`.
+
 ## Multilingual dictionaries (medium)
 
 Explicit `--method openssl` scans use the medium tier by default. Entries are
@@ -92,7 +99,7 @@ DecryptRE cannot recover it. There is no way around that for modern
 cryptography, and the tool does not pretend otherwise.
 
 OpenSSL `enc` without `-pbkdf2` uses a cheap key derivation, so the full
-medium tier is practical there. Auto mode stays on the 10,000 common passwords
+medium tier is practical there. Auto mode stays on the 10,001 common passwords
 so an ordinary `decryptre decrypt` does not turn into a multi-minute scan.
 RockYou is optional because its size and provenance are both significant; the
 default install never includes it.
@@ -100,6 +107,7 @@ default install never includes it.
 ## Replacing them
 
 You can point DecryptRE at any newline-separated wordlist with
-`--wordlist path/to/list.txt`; lines starting with `#` and blank lines are
-ignored. Custom lists are streamed and are not de-duplicated, so keep them
-small enough for the KDF cost to stay reasonable.
+`--wordlist path/to/list.txt`; blank lines and lines whose first character is
+`#` are skipped. Leading and trailing spaces are preserved. Custom lists are
+streamed and are not de-duplicated, so keep them small enough for the KDF cost
+to stay reasonable.

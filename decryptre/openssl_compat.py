@@ -78,7 +78,9 @@ def _digest_label(digest: str) -> str:
     return _DIGEST_LABELS.get(digest, digest.upper())
 PARALLEL_MIN_PASSPHRASES = 1000
 PARALLEL_CHUNK_SIZE = 500
-MAX_DEFAULT_WORKERS = 8
+MAX_DEFAULT_WORKERS = 64
+RESULT_TARGET = 2
+PLAUSIBLE_SCORE = -15.0
 
 
 class OpenSSLError(ValueError):
@@ -373,9 +375,17 @@ def prepare_legacy_attempt(token_text: str) -> LegacyAttempt:
     )
 
 
+def _available_cpus() -> int:
+    """CPUs this process may actually use, respecting Linux affinity masks."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
 def default_workers() -> int:
-    """A conservative default for explicit OpenSSL scan parallelism."""
-    return max(1, min(MAX_DEFAULT_WORKERS, os.cpu_count() or 1))
+    """Use the CPUs available to this process, with a sane upper bound."""
+    return max(1, min(MAX_DEFAULT_WORKERS, _available_cpus()))
 
 
 _WORKER_ATTEMPT: Optional[LegacyAttempt] = None
@@ -405,16 +415,23 @@ def _mark_hit(chunk_index: int) -> None:
             _WORKER_STOP.value = chunk_index
 
 
+def _dictionary_worker_init(token_text: str) -> None:
+    global _WORKER_ATTEMPT
+    _WORKER_ATTEMPT = prepare_legacy_attempt(token_text)
+
+
 def _dictionary_parallel_worker(payload):
+    """Scan a whole chunk and return every plausible hit in it."""
     digest, chunk_index, passwords = payload
-    for offset, password in enumerate(passwords):
-        if _stopped(chunk_index, offset):
-            return None
+    hits = []
+    for password in passwords:
         hit = _WORKER_ATTEMPT.try_digest(password, digest)
-        if hit is not None:
-            _mark_hit(chunk_index)
-            return chunk_index, offset, password, hit[0], hit[1]
-    return None
+        if hit is None:
+            continue
+        candidate = _candidate_for_hit(password, hit[0], hit[1])
+        if candidate is not None:
+            hits.append(candidate)
+    return chunk_index, len(passwords), hits
 
 
 def _incremental_parallel_worker(payload):
@@ -538,21 +555,61 @@ def _iter_chunks(
         yield chunk
 
 
-def _dictionary_candidate(
-    password: bytes, plain: str, alg: str, top: int
-) -> List[Candidate]:
-    return [
-        Candidate(
-            plain,
-            "openssl",
-            {
-                "alg": alg,
-                "passphrase": password.decode("utf-8", "replace"),
-            },
-            score_text(plain),
-            verified=True,
-        )
-    ][:top]
+def is_plausible_plaintext(text: str) -> bool:
+    """Reject padding-valid garbage before it is presented as a match."""
+    stripped = text.strip()
+    if len(stripped) < 2:
+        return False
+    letters = sum(1 for ch in stripped if ch.isalpha())
+    if letters < 2:
+        return False
+    score = score_text(text)
+    if score >= PLAUSIBLE_SCORE:
+        return True
+    # The English model cannot judge Cyrillic, CJK and similar scripts; a
+    # legible non-Latin string still gets through the generic printable check.
+    return score >= -18.0 and any(ord(ch) > 0x024F for ch in stripped)
+
+
+def _candidate_for_hit(
+    password: bytes, plain: str, alg: str
+) -> Optional[Candidate]:
+    if not is_plausible_plaintext(plain):
+        return None
+    return Candidate(
+        plain,
+        "openssl",
+        {
+            "alg": alg,
+            "passphrase": password.decode("utf-8", "replace"),
+        },
+        score_text(plain),
+        verified=True,
+    )
+
+
+def _result_target(top: int) -> int:
+    """Collect up to two plausible results unless the caller asked for one."""
+    return max(1, min(top, RESULT_TARGET))
+
+
+def _rank_candidates(candidates: List[Candidate], top: int) -> List[Candidate]:
+    return sorted(candidates, key=lambda item: item.score, reverse=True)[:top]
+
+
+def _add_candidate(
+    matches: List[Candidate],
+    seen: set,
+    candidate: Optional[Candidate],
+) -> bool:
+    if candidate is None:
+        return False
+    signature = candidate.signature()
+    if signature in seen:
+        return False
+    seen.add(signature)
+    matches.append(candidate)
+    return True
 
 
 def _dictionary_attack_parallel(
@@ -565,22 +622,23 @@ def _dictionary_attack_parallel(
 ) -> List[Candidate]:
     """Run digest phases over a streamed wordlist in spawned workers.
 
-    Only a few chunks are in flight at once. The parent consumes results in
-    order so the earliest wordlist hit is returned, while a shared stop marker
-    tells workers after the hit to abandon their chunks.
+    A few chunks are in flight at once. Workers return every plausible hit in
+    their chunk, and the parent keeps scanning until two results or the tier is
+    exhausted. Results are ranked by text score rather than chunk order.
     """
+    target = _result_target(top)
+    matches: List[Candidate] = []
+    seen = set()
     context = multiprocessing.get_context("spawn")
-    stop = context.Value("i", -1)
     executor = futures.ProcessPoolExecutor(
         max_workers=max(1, workers),
         mp_context=context,
-        initializer=_parallel_worker_init,
-        initargs=(token_text, stop),
+        initializer=_dictionary_worker_init,
+        initargs=(token_text,),
     )
     pending = deque()
     try:
         for digest, label in (("md5", "MD5"), ("sha256", "SHA-256")):
-            stop.value = -1
             pending.clear()
             if progress:
                 progress(0, total, label)
@@ -608,28 +666,22 @@ def _dictionary_attack_parallel(
 
             while pending:
                 _chunk_index, size, job = pending.popleft()
-                result = job.result()
-                if result is None:
-                    done += size
-                    if progress:
-                        progress(min(done, total), total, label)
-                    submit_one()
-                    continue
-
-                _hit_chunk, offset, password, plain, alg = result
+                _chunk, processed, hits = job.result()
+                done += processed
+                for candidate in hits:
+                    _add_candidate(matches, seen, candidate)
                 if progress:
-                    progress(min(done + offset + 1, total), total, label)
-                for _index, _size, later in pending:
-                    later.cancel()
-                return _dictionary_candidate(password, plain, alg, top)
-    except BaseException:
-        stop.value = -2
-        raise
+                    progress(min(done, total), total, label)
+                if len(matches) >= target:
+                    for _index, _size, later in pending:
+                        later.cancel()
+                    return _rank_candidates(matches, top)
+                submit_one()
     finally:
         for _index, _size, job in pending:
             job.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
-    return []
+    return _rank_candidates(matches, top)
 
 
 def _dictionary_attack_serial(
@@ -650,6 +702,9 @@ def _dictionary_attack_serial(
     # a stream cipher with no padding or tag, so a wrong key produces
     # printable-looking output often enough to make wordlist hits meaningless.
     # It remains available with an explicit --key.
+    target = _result_target(top)
+    matches: List[Candidate] = []
+    seen = set()
     for digest in LEGACY_GUESS_DIGESTS:
         label = _digest_label(digest)
         if progress:
@@ -674,13 +729,15 @@ def _dictionary_attack_serial(
                     spec,
                 )
                 if hit:
-                    plain, alg = hit
-                    if progress:
-                        progress(min(index, total), total, label)
-                    return _dictionary_candidate(password, plain, alg, top)
+                    candidate = _candidate_for_hit(password, hit[0], hit[1])
+                    _add_candidate(matches, seen, candidate)
+                    if len(matches) >= target:
+                        if progress:
+                            progress(min(index, total), total, label)
+                        return _rank_candidates(matches, top)
             if progress and (index % step == 0 or index == total):
                 progress(min(index, total), total, label)
-    return []
+    return _rank_candidates(matches, top)
 
 
 def dictionary_attack_stream(

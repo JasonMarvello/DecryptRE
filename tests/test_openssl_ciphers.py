@@ -127,9 +127,24 @@ def test_progress_stops_at_a_hit():
     calls = []
     blob = _cbc_blob(CAST5, MESSAGE, PASSPHRASE)
     openssl_compat.dictionary_attack(
-        blob, ["nope", PASSPHRASE, "later"], progress=lambda *args: calls.append(args)
+        blob,
+        ["nope", PASSPHRASE, "later"],
+        top=1,
+        progress=lambda *args: calls.append(args),
     )
     assert calls[-1] == (2, 3, "MD5")
+
+
+def test_two_result_target_keeps_scanning_after_one_hit():
+    calls = []
+    blob = _cbc_blob(CAST5, MESSAGE, PASSPHRASE)
+    openssl_compat.dictionary_attack(
+        blob,
+        ["nope", PASSPHRASE, "later"],
+        top=2,
+        progress=lambda *args: calls.append(args),
+    )
+    assert calls[-1] == (3, 3, "SHA-256")
 
 
 def test_cli_shows_scan_status(tmp_path, capsys):

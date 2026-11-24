@@ -41,6 +41,21 @@ ROCKYOU_FALLBACK_URL = "https://weakpass.com/download/90/rockyou.txt.gz"
 ROCKYOU_GZ = WORDLIST_DIR / "rockyou-large.txt.gz"
 ROCKYOU_META = WORDLIST_DIR / "rockyou-large.json"
 
+
+class DownloadError(RuntimeError):
+    """A download was truncated or did not contain wordlist data."""
+
+
+def _looks_like_html(path: Path) -> bool:
+    """Best-effort rejection of HTML/XML error pages served as downloads."""
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(1024).lstrip().lower()
+    except OSError:
+        return False
+    return head.startswith((b"<!doctype html", b"<html", b"<?xml"))
+
+
 NOTICE = """\
 RockYou: provenance and ethics notice
 -------------------------------------
@@ -103,6 +118,11 @@ def _download(url: str, destination: Path) -> None:
         url, headers={"User-Agent": "DecryptRE-wordlist-builder/1.0"}
     )
     with urllib.request.urlopen(request, timeout=60) as response:
+        content_type = response.headers.get_content_type()
+        if content_type in ("text/html", "application/xhtml+xml"):
+            raise DownloadError(
+                f"server returned {content_type}, which is not a wordlist"
+            )
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
         next_mark = 0
@@ -121,9 +141,11 @@ def _download(url: str, destination: Path) -> None:
                     )
                     next_mark += 10 * 1024 * 1024
         if total and done != total:
-            raise SystemExit(
-                f"error: download stopped at {done} of {total} bytes"
+            raise DownloadError(
+                f"download stopped at {done} of {total} bytes"
             )
+    if _looks_like_html(destination):
+        raise DownloadError("download looks like an HTML/XML page, not a wordlist")
     print(f"Downloaded {destination.stat().st_size:,} bytes")
 
 
@@ -145,7 +167,7 @@ def verify(write_manifest: bool) -> int:
     """Check the shipped tiers for duplicates and refresh their manifest."""
     entries = {}
     seen = set()
-    total = 0
+    small_seen = set()
     for tier in ("small", "medium"):
         files = wordlist.tier_files(tier)
         tier_total = 0
@@ -156,7 +178,9 @@ def verify(write_manifest: bool) -> int:
             count = 0
             for candidate in wordlist.iter_file(path, comments=False):
                 count += 1
-                if tier == "medium":
+                if tier == "small":
+                    small_seen.add(candidate)
+                else:
                     if candidate in seen:
                         raise SystemExit(
                             "error: duplicate across bundled medium lists: "
@@ -177,10 +201,15 @@ def verify(write_manifest: bool) -> int:
             "count": tier_total,
             "bytes": sum(item["bytes"] for item in file_data),
         }
-        total = tier_total
         print(f"{tier:6} {tier_total:>12,} candidates  {len(files)} files")
 
-    print(f"medium includes small: {entries['medium']['count'] == total:,}")
+    missing = small_seen - seen
+    print(f"medium includes small: {not missing}")
+    if missing:
+        raise SystemExit(
+            "error: small-tier entries are missing from medium: "
+            f"{next(iter(missing))!r}"
+        )
     print(f"unique medium candidates: {len(seen):,}")
     if len(seen) != entries["medium"]["count"]:
         raise SystemExit(
@@ -217,13 +246,22 @@ def fetch_rockyou(source: str, assume_yes: bool, force: bool) -> int:
                         file=sys.stderr,
                     )
                     source = ROCKYOU_FALLBACK_URL
-                    _download(source, download)
+                    try:
+                        _download(source, download)
+                    except Exception as fallback_exc:
+                        raise SystemExit(
+                            f"error: fallback download failed: {fallback_exc}"
+                        ) from fallback_exc
                 else:
-                    raise
+                    raise SystemExit(f"error: download failed: {exc}") from exc
         else:
             download = Path(source)
             if not download.is_file():
                 raise SystemExit(f"error: source file not found: {download}")
+            if _looks_like_html(download):
+                raise SystemExit(
+                    "error: source looks like an HTML/XML page, not a wordlist"
+                )
 
         database = temp_dir / "dedupe.sqlite3"
         db = sqlite3.connect(str(database))

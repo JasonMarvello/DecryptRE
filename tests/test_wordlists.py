@@ -106,3 +106,127 @@ def test_custom_wordlist_replaces_the_bundled_lists(tmp_path):
     path.write_text("# comment\none\n\ntwo\n", encoding="utf-8")
 
     assert load_wordlist(str(path)) == ["one", "two"]
+
+
+@pytest.mark.parametrize(
+    "tier, expected",
+    [
+        ("5m", 5_000_000),
+        ("10m", 10_000_000),
+        ("50m", 50_000_000),
+        ("100m", 100_000_000),
+    ],
+)
+def test_generated_tier_counts(tier, expected):
+    assert wordlist.tier_count(tier) == expected
+
+
+def test_generated_tier_starts_with_the_common_list():
+    stream = wordlist.iter_tier("5m")
+    assert next(stream) == b"password"
+    assert next(stream) == b"123456"
+
+
+def test_generated_seed_variants_are_deterministic_and_unique():
+    first = list(wordlist._iter_seed_variants([b"patty"], 4))
+    second = list(wordlist._iter_seed_variants([b"patty"], 4))
+
+    assert first == second
+    assert first == [
+        b"patty000000",
+        b"Patty000000",
+        b"PATTY000000",
+        b"patty000001",
+    ]
+
+
+def test_names_seed_file_includes_the_requested_examples():
+    names = set(wordlist.iter_file(wordlist.NAMES_PATH, comments=True))
+    assert b"Patty" in names
+    assert b"Verenza" in names
+
+
+def test_generated_tier_has_no_packaged_files():
+    with pytest.raises(wordlist.WordlistError, match="no files"):
+        wordlist.tier_files("5m")
+
+
+def _write_large_manifest(base):
+    (base / "common.txt").write_bytes(b"alpha\n")
+    (base / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tiers": {
+                    "small": {"files": ["common.txt"], "count": 1},
+                    "medium": {"files": ["common.txt"], "count": 1},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_large_tier_requires_existing_artifact(monkeypatch, tmp_path):
+    base = tmp_path
+    _write_large_manifest(base)
+    (base / "rockyou-large.json").write_text(
+        json.dumps(
+            {"file": "rockyou-large.txt.gz", "count": 1, "bytes": 1}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(wordlist, "WORDLIST_DIR", base)
+    monkeypatch.setattr(wordlist, "MANIFEST_PATH", base / "manifest.json")
+    monkeypatch.setattr(
+        wordlist, "ROCKYOU_META_PATH", base / "rockyou-large.json"
+    )
+
+    with pytest.raises(wordlist.WordlistError, match="not shipped"):
+        wordlist.tier_count("large")
+    with pytest.raises(wordlist.WordlistError, match="not shipped"):
+        list(wordlist.iter_tier("large"))
+
+
+def test_large_tier_rejects_incomplete_artifact(monkeypatch, tmp_path):
+    base = tmp_path
+    _write_large_manifest(base)
+    with gzip.open(base / "rockyou-large.txt.gz", "wb") as handle:
+        handle.write(b"alpha\n")
+    size = (base / "rockyou-large.txt.gz").stat().st_size
+    (base / "rockyou-large.json").write_text(
+        json.dumps(
+            {
+                "file": "rockyou-large.txt.gz",
+                "count": 1,
+                "bytes": size + 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(wordlist, "WORDLIST_DIR", base)
+    monkeypatch.setattr(wordlist, "MANIFEST_PATH", base / "manifest.json")
+    monkeypatch.setattr(
+        wordlist, "ROCKYOU_META_PATH", base / "rockyou-large.json"
+    )
+
+    with pytest.raises(wordlist.WordlistError, match="incomplete"):
+        wordlist.tier_count("large")
+
+
+def test_corrupt_large_gzip_reports_wordlist_error(monkeypatch, tmp_path):
+    base = tmp_path
+    _write_large_manifest(base)
+    (base / "rockyou-large.txt.gz").write_bytes(b"not a gzip file")
+    (base / "rockyou-large.json").write_text(
+        json.dumps({"file": "rockyou-large.txt.gz", "count": 1}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(wordlist, "WORDLIST_DIR", base)
+    monkeypatch.setattr(wordlist, "MANIFEST_PATH", base / "manifest.json")
+    monkeypatch.setattr(
+        wordlist, "ROCKYOU_META_PATH", base / "rockyou-large.json"
+    )
+
+    with pytest.raises(wordlist.WordlistError, match="cannot read wordlist"):
+        list(wordlist.iter_tier("large"))

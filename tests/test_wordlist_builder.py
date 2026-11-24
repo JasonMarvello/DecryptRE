@@ -5,6 +5,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 from decryptre import wordlist
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -104,3 +106,71 @@ def test_verify_rejects_duplicates_across_shipped_files(
         assert "duplicate" in str(exc)
     else:  # pragma: no cover - the assertion is the test
         raise AssertionError("verify accepted duplicate wordlist entries")
+
+
+def test_verify_rejects_small_entries_missing_from_medium(
+    monkeypatch, tmp_path
+):
+    base = tmp_path / "wordlists"
+    base.mkdir()
+    (base / "common.txt").write_bytes(b"alpha\nbeta\n")
+    (base / "extra.txt").write_bytes(b"gamma\ndelta\n")
+    (base / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tiers": {
+                    "small": {"files": ["common.txt"], "count": 2},
+                    "medium": {
+                        "files": ["extra.txt"],
+                        "count": 2,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(wordlist, "WORDLIST_DIR", base)
+    monkeypatch.setattr(wordlist, "MANIFEST_PATH", base / "manifest.json")
+
+    builder = _load_builder()
+    with pytest.raises(SystemExit, match="missing from medium"):
+        builder.verify(write_manifest=False)
+
+
+def test_verify_reports_a_true_small_subset(monkeypatch, tmp_path, capsys):
+    base = tmp_path / "wordlists"
+    base.mkdir()
+    (base / "common.txt").write_bytes(b"alpha\nbeta\n")
+    (base / "extra.txt").write_bytes(b"gamma\n")
+    (base / "manifest.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tiers": {
+                    "small": {"files": ["common.txt"], "count": 2},
+                    "medium": {
+                        "files": ["common.txt", "extra.txt"],
+                        "count": 3,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(wordlist, "WORDLIST_DIR", base)
+    monkeypatch.setattr(wordlist, "MANIFEST_PATH", base / "manifest.json")
+
+    builder = _load_builder()
+    assert builder.verify(write_manifest=False) == 0
+    assert "medium includes small: True" in capsys.readouterr().out
+
+
+def test_fetch_rejects_html_source(tmp_path, capsys):
+    source = tmp_path / "rockyou.html"
+    source.write_bytes(b"<!DOCTYPE html>\n<html><body>error</body></html>\n")
+
+    builder = _load_builder()
+    with pytest.raises(SystemExit, match="HTML"):
+        builder.fetch_rockyou(str(source), assume_yes=True, force=False)
+    capsys.readouterr()

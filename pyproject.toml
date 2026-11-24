@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decryptre"
-version = "0.4.0"
+version = "1.0.0"
 description = "Offline, open-source CLI that decrypts text with or without a passphrase and re-encrypts it with the same methods."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Jason Marvello" }]
 keywords = ["cryptography", "ciphers", "ctf", "decryption", "offline"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Education",
     "Programming Language :: Python :: 3",
@@ -39,9 +39,15 @@ namespaces = true
 
 [tool.setuptools.package-data]
 decryptre = [
-    "wordlists/*.txt",
+    "wordlists/common-passwords.txt",
+    "wordlists/dictionary-english.txt",
+    "wordlists/dictionary-hindi.txt",
+    "wordlists/dictionary-indonesian.txt",
+    "wordlists/dictionary-russian.txt",
+    "wordlists/dictionary-ukrainian.txt",
+    "wordlists/names.txt",
     "wordlists/manifest.json",
-    "wordlists/*.md",
+    "wordlists/SOURCE.md",
     "data/*.txt",
     "data/*.md",
 ]

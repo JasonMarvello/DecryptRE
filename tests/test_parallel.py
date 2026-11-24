@@ -112,6 +112,76 @@ def test_streaming_keeps_non_utf8_passphrase_bytes():
     assert result[0].params["passphrase"] == "\ufffdsecret"
 
 
+def test_two_plausible_matches_are_collected(monkeypatch):
+    salt = b"12345678"
+    body = b"\x00" * 16
+    blob = base64.b64encode(b"Salted__" + salt + body).decode("ascii")
+    passwords = (b"alpha", b"beta")
+    keys = {}
+    for password in passwords:
+        key, _iv = openssl_compat.evp_bytes_to_key(
+            password, salt, 32, 16, "md5"
+        )
+        keys[key] = password
+
+    def fake_decrypt(body, key, iv, label, spec):
+        password = keys.get(key)
+        if password is None:
+            return None
+        return (
+            f"The secret message for {password.decode()} is readable.",
+            "OpenSSL test",
+        )
+
+    monkeypatch.setattr(openssl_compat, "_decrypt_with", fake_decrypt)
+    results = openssl_compat.dictionary_attack_stream(
+        blob,
+        lambda: iter(passwords),
+        len(passwords),
+        top=2,
+        workers=1,
+    )
+
+    assert {item.params["passphrase"] for item in results} == {"alpha", "beta"}
+    assert all(item.verified for item in results)
+
+
+def test_parallel_worker_returns_every_plausible_hit_in_a_chunk(monkeypatch):
+    class FakeAttempt:
+        def try_digest(self, password, digest):
+            if password in (b"alpha", b"beta"):
+                return (
+                    f"A readable secret message from {password.decode()}.",
+                    "OpenSSL test",
+                )
+            return None
+
+    monkeypatch.setattr(openssl_compat, "_WORKER_ATTEMPT", FakeAttempt())
+    _chunk, processed, hits = openssl_compat._dictionary_parallel_worker(
+        ("md5", 0, [b"alpha", b"nope", b"beta"])
+    )
+
+    assert processed == 3
+    assert {item.params["passphrase"] for item in hits} == {"alpha", "beta"}
+
+
+def test_gibberish_padding_hit_is_not_returned(monkeypatch):
+    salt = b"12345678"
+    body = b"\x00" * 16
+    blob = base64.b64encode(b"Salted__" + salt + body).decode("ascii")
+    key, _iv = openssl_compat.evp_bytes_to_key(b"alpha", salt, 32, 16, "md5")
+
+    def fake_decrypt(body, candidate_key, iv, label, spec):
+        if candidate_key == key:
+            return ("xJ9$vQ2!", "OpenSSL test")
+        return None
+
+    monkeypatch.setattr(openssl_compat, "_decrypt_with", fake_decrypt)
+    assert openssl_compat.dictionary_attack_stream(
+        blob, lambda: iter([b"alpha"]), 1, top=2, workers=1
+    ) == []
+
+
 def test_chunking_is_bounded_and_preserves_order():
     chunks = list(
         openssl_compat._iter_chunks(

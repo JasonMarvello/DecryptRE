@@ -9,9 +9,11 @@ It handles encodings (Base64, Base32, hex, URL, ASCII85), classical ciphers
 passphrase-based modern crypto (Fernet, AES-256 and legacy 3DES). It also
 opens OpenSSL `Salted__` blobs and recognises common hashes.
 
-**Everything runs offline.** There are no API calls, no telemetry, no remote
-wordlists, and no internet connection is needed after installation. A test in
-the repository enforces this.
+**Everything runs offline at runtime.** The installed package makes no API
+calls, sends no telemetry, and uses no remote wordlists; no internet connection
+is needed after installation. A test in the repository enforces this. The
+optional local `large`-tier builder is the only component that downloads
+anything, and only when you run it explicitly.
 
 ---
 
@@ -148,9 +150,9 @@ decryptre decrypt --input <file|text|-> [options]
 | `--shift N` | try all | Caesar shift. |
 | `--rails N` | try 2-12 | Rail Fence rails. |
 | `--wordlist PATH` | bundled list | Passphrase list for Fernet/AES/3DES. Replaces the bundled tiers. |
-| `--wordlist-tier small\|medium\|large` | `medium` | Bundled list size for explicit `--method openssl`: 10k, 1.37M, or medium plus a locally built RockYou tier. `large` is not shipped on PyPI. |
+| `--wordlist-tier` | `medium` | `small`, `medium`, `large`, or generated `5m`/`10m`/`50m`/`100m` for explicit `--method openssl`. `large` adds local RockYou; generated tiers are not shipped as data. |
 | `--no-wordlist` | off | Skip the bundled wordlist. |
-| `--workers N` | CPU count, capped at 8 | Worker processes for explicit `--method openssl` wordlist and incremental scans. `--workers 1` disables; auto mode stays single-process. |
+| `--workers N` | available CPUs, capped at 64 | Worker processes for explicit `--method openssl` wordlist and incremental scans. `--workers 1` disables; auto mode stays single-process. |
 | `--incremental` | off | Opt-in exhaustive passphrase search for OpenSSL `Salted__` blobs. Requires `--method openssl`; auto mode never starts it. See [Incremental search](#incremental-search-opt-in-exhaustive-passphrase-search). |
 | `--charset NAME` | `lower+upper+digits` | Charset component(s) for `--incremental`: `lower`, `upper`, `digits`, `symbols`, `all`. Repeat to combine. |
 | `--min-length N` | `1` | Shortest passphrase length for `--incremental`. |
@@ -323,6 +325,10 @@ medium tier is globally deduplicated at build time.
 | `small` | 10,001 | Auto mode and modern-container scans; optional for explicit OpenSSL | yes |
 | `medium` | 1,368,353 | Default for explicit `--method openssl` | yes |
 | `large` | medium + local RockYou | Optional local build for explicit `--method openssl` | **no** |
+| `5m` | 5,000,000 | Generated English/name/language variants | **no data** |
+| `10m` | 10,000,000 | Generated English/name/language variants | **no data** |
+| `50m` | 50,000,000 | Generated English/name/language variants | **no data** |
+| `100m` | 100,000,000 | Generated English/name/language variants | **no data** |
 
 Provenance and licenses for the shipped lists are in
 [`decryptre/wordlists/SOURCE.md`](decryptre/wordlists/SOURCE.md).
@@ -340,6 +346,16 @@ decryptre decrypt --input blob.txt --method openssl --wordlist my-words.txt
 with it, with `--key`, `--incremental`, or `--no-wordlist`. Auto mode stays on
 `small` and rejects the tier option, so an ordinary decode never turns into a
 multi-minute scan.
+
+The `5m`, `10m`, `50m` and `100m` options are generated on demand; the counts
+include the bundled medium prefix, so they always begin with the common list.
+They add English and personal-name variants first, then the other bundled
+languages. No generated passphrases are stored in the package.
+
+Custom lists are newline-separated. Blank lines and lines whose first character
+is `#` are skipped; leading and trailing spaces are preserved, so a passphrase
+such as `  spaced  ` is tried exactly as written. Custom lists are streamed and
+not de-duplicated.
 
 ### Optional local `large` tier (RockYou)
 
@@ -364,7 +380,13 @@ excluded from the package; delete them with
 `--wordlist-tier large` prints the build command instead of failing obscurely.
 
 `python tools/build_wordlists.py --verify` checks the shipped tiers for
-duplicates; add `--write-manifest` to refresh the committed counts.
+duplicates and confirms every small-tier entry is present in medium; add
+`--write-manifest` to refresh the committed counts.
+
+OpenSSL dictionary scans keep looking after the first plausible plaintext
+until they find a second result or exhaust the list. Results are ranked by
+text plausibility, and padding-valid gibberish is filtered out. Pass `--top 1`
+to stop at the first plausible result.
 
 The substitution solver uses aggregate English trigram statistics derived
 from a public-domain book; see
@@ -376,18 +398,18 @@ included, never any text from the source.
 ## Parallel scans (explicit OpenSSL only)
 
 When `--method openssl` runs a wordlist scan or `--incremental`, DecryptRE
-uses one worker process per available CPU (capped at 8) by default.
-`--workers 1` restores the single-process path, and any positive number
-overrides the default.
+uses one worker process per CPU available to the process (capped at 64) by
+default. `--workers 1` restores the single-process path, and any positive
+number overrides the default.
 
 Work is split into ordered 500-candidate chunks. Dictionary chunks are read
 from the tier stream on demand, with only a few chunks in flight at once, so
 the parent process does not build a futures list for all 1.37M (or 15M local)
-candidates. Results are still consumed in the original order, so a dictionary
-hit or incremental hit is the same first readable result the serial scan
-would have found. Later chunks stop as soon as an earlier chunk reports a
-hit. Incremental checkpoints advance only over the contiguous completed
-prefix, so a resume never skips work that is still in flight.
+wordlist entries. Each worker returns every plausible hit in its chunk; the
+parent keeps scanning until it has two results or exhausts the tier, then
+ranks them by text score. `--top 1` restores stop-at-first behavior.
+Incremental checkpoints advance only over the contiguous completed prefix, so
+a resume never skips work that is still in flight.
 
 Auto mode and the modern AES/Fernet/3DES dictionary do not use this pool;
 `--workers` is rejected outside explicit OpenSSL scans.

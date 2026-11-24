@@ -89,7 +89,14 @@ def test_tier_validation(argv, message):
 
 @pytest.mark.parametrize(
     "tier, expected",
-    [("small", 10_001), ("medium", 1_368_353)],
+    [
+        ("small", 10_001),
+        ("medium", 1_368_353),
+        ("5m", 5_000_000),
+        ("10m", 10_000_000),
+        ("50m", 50_000_000),
+        ("100m", 100_000_000),
+    ],
 )
 def test_explicit_openssl_uses_requested_tier(
     monkeypatch, capsys, tier, expected

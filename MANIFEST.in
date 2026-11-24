@@ -1,1 +1,2 @@
 include tools/build_wordlists.py
+include decryptre/wordlists/names.txt

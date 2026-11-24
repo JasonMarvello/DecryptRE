@@ -114,7 +114,7 @@ def load_wordlist(path: Optional[str] = None) -> List[str]:
     """Load a passphrase list for callers that need it in memory.
 
     A user-supplied ``path`` replaces the bundled lists. The bundled default is
-    the medium tier: 10,000 common passwords plus the multilingual
+    the medium tier: 10,001 common passwords plus the multilingual
     dictionaries. Explicit OpenSSL scans stream this tier instead of calling
     this function.
     """
@@ -137,9 +137,9 @@ _B64_SHAPE = re.compile(r"^[A-Za-z0-9+/=_-]+$")
 class OpenSSLScanStatus:
     """Short progress lines while an OpenSSL wordlist scan runs.
 
-    A 10,000-word scan takes several seconds with no output, which looks like
-    a freeze. Print a starting line and a few milestones. Short wordlists
-    stay quiet because they finish immediately.
+    A scan of the 10,001-entry small tier takes several seconds with no
+    output, which looks like a freeze. Print a starting line and a few
+    milestones. Short wordlists stay quiet because they finish immediately.
     """
 
     def __init__(self, stream=None, minimum: int = 500, prefix: str = "") -> None:
@@ -148,6 +148,7 @@ class OpenSSLScanStatus:
         self.prefix = prefix
         self._started = False
         self._last_mark = -1
+        self._phase_started = 0.0
 
     def __call__(self, done: int, total: int, digest: str) -> None:
         if total < self.minimum:
@@ -163,13 +164,27 @@ class OpenSSLScanStatus:
             self._started = True
         if done <= 0:
             self._last_mark = -1
+            self._phase_started = time.monotonic()
             return
         quarter = max(1, total // 4)
         mark = 4 if done >= total else done // quarter
         if mark > 0 and mark != self._last_mark:
             self._last_mark = mark
+            elapsed = max(0.001, time.monotonic() - self._phase_started)
+            rate = done / elapsed
+            remaining = max(0.0, (total - done) / rate)
+            minutes, seconds = divmod(int(remaining + 0.5), 60)
+            hours, minutes = divmod(minutes, 60)
+            eta = (
+                f"{hours}h {minutes}m"
+                if hours
+                else f"{minutes}m {seconds}s"
+                if minutes
+                else f"{seconds}s"
+            )
             print(
-                f"{self.prefix}  {digest}: {done:,}/{total:,} passphrases",
+                f"{self.prefix}  {digest}: {done:,}/{total:,} "
+                f"passphrases · {rate:,.0f}/s · ETA {eta}",
                 file=self.stream,
                 flush=True,
             )
@@ -630,6 +645,12 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
                     "No passphrase in the wordlist opened this OpenSSL blob. "
                     "Supply --key if you know it."
                 )
+            if len(results) == 1 and args.top != 1:
+                print(
+                    "Only one plausible passphrase result was found; the "
+                    "scan completed without a second.",
+                    file=sys.stderr,
+                )
             return results
         hit = openssl_compat.try_decrypt(text, args.key)
         if hit is None:
@@ -961,18 +982,20 @@ def build_parser() -> argparse.ArgumentParser:
     decrypt.add_argument(
         "--wordlist",
         help=(
-            "file of passphrases to try, one per line (replaces the bundled "
-            "lists)"
+            "file of passphrases to try, one per line; blank lines and lines "
+            "starting with # are skipped, and whitespace is preserved "
+            "(replaces the bundled lists)"
         ),
     )
     decrypt.add_argument(
         "--wordlist-tier",
-        choices=("small", "medium", "large"),
+        choices=("small", "medium", "large", "5m", "10m", "50m", "100m"),
         default=None,
         help=(
-            "bundled list size for explicit --method openssl scans: small "
-            "(10,000), medium (1.37M, default) or large (medium + a locally "
-            "built RockYou tier). Not shipped with PyPI."
+            "wordlist size for explicit --method openssl scans: small "
+            "(10,001), medium (1.37M, default), large (medium + local "
+            "RockYou), or generated 5m/10m/50m/100m tiers. Generated tiers "
+            "try the common list first and are not shipped as data."
         ),
     )
     decrypt.add_argument(
@@ -986,7 +1009,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "worker processes for explicit OpenSSL wordlist/incremental "
-            "scans (default: CPU count, capped at 8; 1 disables)"
+            "scans (default: CPUs available to this process, capped at 64; "
+            "1 disables)"
         ),
     )
     incremental_options = decrypt.add_argument_group(
