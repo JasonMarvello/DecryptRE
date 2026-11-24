@@ -133,6 +133,11 @@ Encrypt and identify work the same way.
 `decryptre --help` still prints the full command reference, and when input is
 piped (`cat cipher.txt | decryptre`) the help is printed instead of the menu.
 
+If the input is an OpenSSL `Salted__` blob and you leave the passphrase
+blank, the UI asks for a wordlist tier: small (10,001), medium (1.37M,
+default), large (local RockYou only), or generated 5M/10M/50M/100M. The scan
+streams and reports throughput and ETA.
+
 ---
 
 ## Commands
@@ -323,7 +328,7 @@ medium tier is globally deduplicated at build time.
 | Tier | Candidates | Used by | Shipped on PyPI |
 | --- | ---: | --- | --- |
 | `small` | 10,001 | Auto mode and modern-container scans; optional for explicit OpenSSL | yes |
-| `medium` | 1,368,353 | Default for explicit `--method openssl` | yes |
+| `medium` | 1,368,353 | Default for explicit `--method openssl` and the interactive OpenSSL picker | yes |
 | `large` | medium + local RockYou | Optional local build for explicit `--method openssl` | **no** |
 | `5m` | 5,000,000 | Generated English/name/language variants | **no data** |
 | `10m` | 10,000,000 | Generated English/name/language variants | **no data** |

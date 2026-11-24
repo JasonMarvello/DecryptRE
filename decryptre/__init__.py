@@ -4,7 +4,7 @@ Everything in this package runs locally. There are no network calls, no
 telemetry and no remote wordlists.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 from .models import Candidate  # noqa: F401
 

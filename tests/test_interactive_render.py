@@ -21,7 +21,7 @@ class _FakeStdout:
         return True
 
 
-def _play_menu(monkeypatch, keys, title, options, width=40):
+def _play_menu(monkeypatch, keys, title, options, width=40, default=0):
     fake = _FakeStdout()
     monkeypatch.setattr(interactive, "_is_tty", lambda: True)
     monkeypatch.setattr(interactive, "_enable_ansi", lambda: True)
@@ -30,7 +30,7 @@ def _play_menu(monkeypatch, keys, title, options, width=40):
     monkeypatch.setattr(interactive.sys, "stdout", fake)
     feed = iter(keys)
     monkeypatch.setattr(interactive, "_read_key", lambda: next(feed))
-    result = interactive.menu(title, options)
+    result = interactive.menu(title, options, default=default)
     return fake.data, result
 
 
@@ -50,6 +50,14 @@ def test_redraw_moves_up_exactly_the_previous_physical_height(monkeypatch):
         len(interactive._menu_rows(title, options, 2, 40)),
     ]
     assert moved == expected
+
+
+def test_menu_can_preselect_a_default_option(monkeypatch):
+    _data, result = _play_menu(
+        monkeypatch, ["enter"], "Pick:", ["small", "medium", "5m"], default=2
+    )
+
+    assert result == 2
 
 
 def test_every_rendered_row_fits_the_terminal_width():

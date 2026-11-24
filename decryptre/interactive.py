@@ -15,7 +15,16 @@ import textwrap
 import unicodedata
 from typing import List, Optional, Sequence, Tuple
 
-from . import __version__, classical, encodings, modern_crypto, present, xor
+from . import (
+    __version__,
+    classical,
+    encodings,
+    modern_crypto,
+    openssl_compat,
+    present,
+    wordlist as wordlists,
+    xor,
+)
 from .auto_detect import detect
 from .cli import (
     OpenSSLScanStatus,
@@ -35,7 +44,7 @@ BANNER = r"""
                        |___/   offline text recovery
 """
 
-HINT = "  up/down or j/k move  ·  1-6 jump  ·  Enter select  ·  q back  ·  Ctrl+C quit"
+HINT = "  up/down or j/k move  ·  1-9 jump  ·  Enter select  ·  q back  ·  Ctrl+C quit"
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +268,14 @@ def _fallback_menu(title: str, options: Sequence[str]) -> Optional[int]:
         print("  Please enter one of the numbers shown.")
 
 
-def menu(title: str, options: Sequence[str]) -> Optional[int]:
-    """Show a menu and return the chosen index, or None to go back."""
+def menu(
+    title: str, options: Sequence[str], default: int = 0
+) -> Optional[int]:
+    """Show a menu and return the chosen index, or None to go back.
+
+    ``default`` preselects an option in the arrow-key menu. The append-only
+    fallback has no selection marker, so it simply waits for a number.
+    """
     if not options:
         return None
     if not _is_tty() or not _enable_ansi():
@@ -268,7 +283,7 @@ def menu(title: str, options: Sequence[str]) -> Optional[int]:
         # that does not understand cursor movement.
         return _fallback_menu(title, options)
 
-    index = 0
+    index = min(max(default, 0), len(options) - 1)
     width = _terminal_width()
     sys.stdout.write("\033[?25l")
     height = _paint_rows(_menu_rows(title, options, index, width), 0)
@@ -384,8 +399,68 @@ def _results_screen(results: List[Candidate]) -> None:
         return
 
 
-def _search(text: str, key: str, quiet: bool = False) -> List[Candidate]:
+TIER_ORDER = ("small", "medium", "large", "5m", "10m", "50m", "100m")
+
+
+def _choose_openssl_tier() -> Optional[str]:
+    """Ask which passphrase tier to use for an OpenSSL blob."""
+    labels: List[str] = []
+    tiers: List[str] = []
+    for tier in TIER_ORDER:
+        try:
+            count = wordlists.tier_count(tier)
+            suffix = " (default)" if tier == "medium" else ""
+            labels.append(f"{tier} - {count:,} candidates{suffix}")
+        except wordlists.WordlistError:
+            labels.append(f"{tier} - unavailable (local RockYou not installed)")
+        tiers.append(tier)
+
+    choice = menu(
+        "OpenSSL blob detected. Choose a passphrase wordlist tier:",
+        labels,
+        default=1,
+    )
+    if choice is None:
+        return None
+    return tiers[choice]
+
+
+def _scan_openssl_tier(
+    text: str, tier: str, quiet: bool = False
+) -> List[Candidate]:
+    """Stream one tier against an OpenSSL blob, with the same worker defaults."""
+    try:
+        total = wordlists.tier_count(tier)
+
+        def factory():
+            return wordlists.iter_tier(tier)
+
+    except wordlists.WordlistError as exc:
+        print(f"  Cannot load the {tier} tier: {exc}")
+        return []
+
+    if not quiet:
+        print(
+            f"  Scanning the {tier} tier ({total:,} passphrases)...",
+            flush=True,
+        )
+    return openssl_compat.dictionary_attack_stream(
+        text,
+        factory,
+        total,
+        top=2,
+        progress=OpenSSLScanStatus(stream=sys.stdout, prefix="  "),
+        workers=openssl_compat.default_workers(),
+    )
+
+
+def _search(
+    text: str, key: str, quiet: bool = False, tier: Optional[str] = None
+) -> List[Candidate]:
     """Decrypt ``text`` and return the best candidates."""
+    if tier and not key and openssl_compat.looks_like(text):
+        return _scan_openssl_tier(text, tier, quiet=quiet)
+
     results: List[Candidate] = []
     if key:
         hit = modern_crypto.try_decrypt_any(text, key)
@@ -435,9 +510,24 @@ def decrypt_flow() -> None:
     text = read_input(text)
     key = ask("Passphrase, if you know it (blank to search):")
 
-    results = _search(text, key)
+    tier = None
+    if not key and openssl_compat.looks_like(text):
+        tier = _choose_openssl_tier()
+        if tier is None:
+            return
+
+    results = _search(text, key, tier=tier)
     if not results:
-        print("  Nothing decoded. Try the CLI with --max-depth 4 or an explicit method.")
+        if tier:
+            print(
+                f"  No passphrase in the {tier} tier opened this blob. "
+                "Try a larger tier or supply the passphrase."
+            )
+        else:
+            print(
+                "  Nothing decoded. Try the CLI with --max-depth 4 or an "
+                "explicit method."
+            )
         pause()
         return
     _results_screen(results)
@@ -543,6 +633,8 @@ def help_screen() -> None:
     * --input takes text, a file path, or - to read stdin.
     * With --key, auto mode also opens AES/Fernet/3DES containers and the
       cipher verifies the passphrase, so the result is marked high confidence.
+    * For OpenSSL blobs without a passphrase, the UI asks for a wordlist tier
+      from 10,001 entries through the generated 100M tier.
     * Only DecryptRE (decryptre:v1:) containers can be opened this way.
     * 3DES exists for legacy data only; do not encrypt new data with it.
     * --top 10 shows more results; --max-depth 4 peels more layers.
