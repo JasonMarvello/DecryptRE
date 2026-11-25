@@ -19,6 +19,30 @@ PASSPHRASE = "pass123"
 USER_BLOB = "U2FsdGVkX1/BgMIekKoYhbG+zWYlJr2X"
 
 
+def _key_schedule(blob, passphrase, cipher):
+    """Return (attempt, spec, key, iv) for one cipher family."""
+    labels = {
+        "aes-256-cbc": "AES-256-CBC",
+        "aes-128-cbc": "AES-128-CBC",
+        "des3-cbc": "3DES-CBC",
+        "des-cbc": "DES-CBC",
+    }
+    salt = b"12345678"
+    key_lengths = {
+        "aes-256-cbc": (32, 16),
+        "aes-128-cbc": (16, 16),
+        "des3-cbc": (24, 8),
+        "des-cbc": (8, 8),
+    }
+    key_length, iv_length = key_lengths[cipher]
+    key, iv = openssl_compat.evp_bytes_to_key(
+        passphrase.encode(), salt, key_length, iv_length, "md5"
+    )
+    attempt = openssl_compat.prepare_legacy_attempt(blob)
+    spec = next(item for item in attempt.ciphers if item.label == labels[cipher])
+    return attempt, spec, key, iv
+
+
 def encrypt_openssl(text, passphrase, cipher="aes-256-cbc", digest="md5"):
     """Build an OpenSSL-compatible salted blob for the tests."""
     salt = b"12345678"
@@ -151,3 +175,53 @@ def test_cli_explicit_method_without_key_needs_wordlist():
     with pytest.raises(SystemExit) as excinfo:
         main(["decrypt", "--input", USER_BLOB, "--method", "openssl", "--no-wordlist"])
     assert "need --key" in str(excinfo.value)
+
+
+def test_last_block_padding_check_accepts_every_cipher_family():
+    text = "multi block plaintext for padding checks" * 20
+    for cipher in ("aes-256-cbc", "aes-128-cbc", "des3-cbc", "des-cbc"):
+        blob = encrypt_openssl(text, PASSPHRASE, cipher)
+        attempt, spec, key, iv = _key_schedule(blob, PASSPHRASE, cipher)
+
+        # The fast reject must accept a real key, including for the 8-byte
+        # block ciphers, without changing the decrypted text.
+        assert openssl_compat._valid_padding_block(
+            attempt.body, key, iv, spec
+        )
+        decrypted = openssl_compat._decrypt_with(
+            attempt.body, key, iv, "label", spec
+        )
+        assert decrypted == (text, "label")
+
+
+def test_last_block_padding_check_rejects_a_wrong_key():
+    blob = encrypt_openssl(MESSAGE, PASSPHRASE)
+    attempt, spec, _key, iv = _key_schedule(blob, PASSPHRASE, "aes-256-cbc")
+    wrong_key = b"\x01" * spec.key_length
+
+    assert openssl_compat._decrypt_with(
+        attempt.body, wrong_key, iv, "label", spec
+    ) is None
+
+
+def test_single_block_body_uses_the_iv_for_the_padding_check():
+    # A one-block body has no previous ciphertext block; the IV supplies it.
+    short = "hello"
+    blob = encrypt_openssl(short, PASSPHRASE)
+    attempt, spec, key, iv = _key_schedule(blob, PASSPHRASE, "aes-256-cbc")
+
+    assert len(attempt.body) == spec.block_size
+    assert openssl_compat._valid_padding_block(attempt.body, key, iv, spec)
+    assert openssl_compat._valid_padding_block(
+        attempt.body, key, b"\x00" * len(iv), spec
+    ) is False
+
+
+def test_large_multiblock_body_still_decrypts_exactly():
+    text = "0123456789abcdef" * 8192  # 128 KiB, many blocks
+    blob = encrypt_openssl(text, PASSPHRASE)
+    attempt, spec, key, iv = _key_schedule(blob, PASSPHRASE, "aes-256-cbc")
+
+    assert openssl_compat._decrypt_with(
+        attempt.body, key, iv, "label", spec
+    ) == (text, "label")

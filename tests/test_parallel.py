@@ -4,7 +4,7 @@ import base64
 from pathlib import Path
 
 import pytest
-from Crypto.Cipher import AES
+from Crypto.Cipher import AES, DES3
 from Crypto.Util.Padding import pad
 
 from decryptre import incremental, openssl_compat
@@ -93,7 +93,10 @@ def test_streaming_parallel_scans_and_reopens_for_both_digests():
     )
 
     assert result == []
-    assert len(calls) == 2  # MD5 phase, then SHA-256 phase
+    # AES-first MD5 and SHA-256 passes, then the all-cipher MD5 and SHA-256
+    # passes. The list is shorter than the AES-first prefix, so every phase
+    # covers all of it.
+    assert len(calls) == 4
 
 
 def test_streaming_keeps_non_utf8_passphrase_bytes():
@@ -148,7 +151,10 @@ def test_two_plausible_matches_are_collected(monkeypatch):
 
 def test_parallel_worker_returns_every_plausible_hit_in_a_chunk(monkeypatch):
     class FakeAttempt:
-        def try_digest(self, password, digest):
+        ciphers = ()
+        aes_ciphers = ()
+
+        def try_digest(self, password, digest, ciphers=None):
             if password in (b"alpha", b"beta"):
                 return (
                     f"A readable secret message from {password.decode()}.",
@@ -158,7 +164,7 @@ def test_parallel_worker_returns_every_plausible_hit_in_a_chunk(monkeypatch):
 
     monkeypatch.setattr(openssl_compat, "_WORKER_ATTEMPT", FakeAttempt())
     _chunk, processed, hits = openssl_compat._dictionary_parallel_worker(
-        ("md5", 0, [b"alpha", b"nope", b"beta"])
+        ("md5", 0, [b"alpha", b"nope", b"beta"], False)
     )
 
     assert processed == 3
@@ -193,6 +199,25 @@ def test_chunking_is_bounded_and_preserves_order():
     assert chunks[-1][-1] == b"10"
 
 
+def test_worker_initializers_apply_the_requested_priority(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        openssl_compat, "lower_priority", lambda mode: seen.append(mode) or True
+    )
+    monkeypatch.setattr(
+        openssl_compat, "prepare_legacy_attempt", lambda text: "attempt"
+    )
+
+    try:
+        openssl_compat._dictionary_worker_init("blob", "normal")
+        openssl_compat._parallel_worker_init("blob", object(), "background")
+    finally:
+        openssl_compat._WORKER_ATTEMPT = None
+        openssl_compat._WORKER_STOP = None
+
+    assert seen == ["normal", "background"]
+
+
 def test_workers_flag_is_documented_and_validated(capsys):
     with pytest.raises(SystemExit):
         main(["decrypt", "--help"])
@@ -203,3 +228,74 @@ def test_workers_flag_is_documented_and_validated(capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["decrypt", "--input", "hello", "--workers", "2"])
     assert "--method openssl" in str(excinfo.value)
+
+
+def test_scan_phases_put_aes_first_over_the_common_prefix():
+    blob = _aes_blob("whatever")
+    attempt = openssl_compat.prepare_legacy_attempt(blob)
+
+    phases = list(openssl_compat._scan_phases(attempt, 5_000_000))
+
+    assert [digest for digest, _label, _ciphers, _limit in phases] == [
+        "md5",
+        "sha256",
+        "md5",
+        "sha256",
+    ]
+    assert all(
+        spec.label.startswith("AES-") for spec in phases[0][2]
+    )
+    assert phases[0][3] == phases[1][3] == openssl_compat.AES_FIRST_PREFIX
+    assert phases[2][2] is None and phases[3][2] is None
+    assert phases[2][3] == phases[3][3] == 5_000_000
+
+
+def test_scan_phases_cover_a_list_shorter_than_the_prefix():
+    attempt = openssl_compat.prepare_legacy_attempt(_aes_blob("whatever"))
+
+    phases = list(openssl_compat._scan_phases(attempt, 1200))
+
+    assert [limit for _digest, _label, _ciphers, limit in phases] == [
+        1200,
+        1200,
+        1200,
+        1200,
+    ]
+
+
+def test_legacy_cipher_hits_are_still_found_after_the_aes_pass():
+    target = "legacy-target"
+    words = [f"nope-{index}" for index in range(1200)]
+    words[1100] = target
+    salt = b"12345678"
+    key, iv = openssl_compat.evp_bytes_to_key(
+        target.encode(), salt, 24, 8, "md5"
+    )
+    body = DES3.new(key, DES3.MODE_CBC, iv).encrypt(
+        pad(MESSAGE.encode(), 8)
+    )
+    blob = base64.b64encode(b"Salted__" + salt + body).decode("ascii")
+
+    results = openssl_compat.dictionary_attack_stream(
+        blob, lambda: iter(words), len(words), top=1, workers=2
+    )
+
+    assert results
+    assert results[0].text == MESSAGE
+    assert results[0].params["passphrase"] == target
+
+
+def test_priority_is_passed_into_a_streaming_scan(monkeypatch):
+    seen = {}
+
+    def fake_stream(text, factory, total, **kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(openssl_compat, "dictionary_attack_stream", fake_stream)
+
+    openssl_compat.dictionary_attack(
+        _aes_blob("whatever"), [b"alpha"], priority="normal"
+    )
+
+    assert seen["priority"] == "normal"

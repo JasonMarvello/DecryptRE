@@ -106,21 +106,26 @@ def test_cli_reports_blowfish(capsys):
     assert MESSAGE in out
 
 
-def test_progress_reports_every_digest():
+def test_progress_reports_every_digest_and_cipher_pass():
     calls = []
     blob = _cbc_blob(CAST5, MESSAGE, "not-in-the-list")
     words = [f"pw{index}" for index in range(40)]
     openssl_compat.dictionary_attack(
         blob, words, progress=lambda *args: calls.append(args)
     )
-    assert calls[0] == (0, 40, "MD5")
-    assert calls[-1] == (40, 40, "SHA-256")
-    for done, total, digest in calls:
+    labels = [label for _done, _total, label in calls]
+    assert labels[0] == "MD5 \u00b7 AES first"
+    assert labels[-1] == "SHA-256"
+    for done, total, label in calls:
         assert 0 <= done <= total == 40
-        assert digest in ("MD5", "SHA-256")
-    # MD5 milestones come before SHA-256 milestones.
-    first_sha = next(index for index, call in enumerate(calls) if call[2] == "SHA-256")
-    assert all(call[2] == "MD5" for call in calls[:first_sha])
+        assert label in (
+            "MD5 \u00b7 AES first",
+            "SHA-256 \u00b7 AES first",
+            "MD5",
+            "SHA-256",
+        )
+    # Both AES-only passes finish before the exhaustive all-cipher passes.
+    assert labels.index("SHA-256 \u00b7 AES first") < labels.index("MD5")
 
 
 def test_progress_stops_at_a_hit():

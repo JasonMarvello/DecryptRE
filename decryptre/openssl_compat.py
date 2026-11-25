@@ -20,13 +20,16 @@ import hashlib
 import multiprocessing
 import os
 from collections import deque
+from itertools import islice
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, Iterable, Iterator, List, Optional, Tuple, Union
 
 from Crypto.Cipher import AES, ARC4, DES, DES3
 from Crypto.Util.Padding import unpad
 
 from .models import Candidate
+from .resources import lower_priority
 from .scorer import printable_ratio, score_text
 
 try:  # cryptography >= 43 keeps these legacy ciphers in ``decrepit``.
@@ -78,6 +81,11 @@ def _digest_label(digest: str) -> str:
     return _DIGEST_LABELS.get(digest, digest.upper())
 PARALLEL_MIN_PASSPHRASES = 1000
 PARALLEL_CHUNK_SIZE = 500
+# AES-256-CBC is the `openssl enc` default and the first candidates are the
+# bundled common-password list, where most real hits live. Scanning that
+# prefix with AES only is about four times cheaper per guess than trying every
+# legacy cipher; the exhaustive passes that follow still cover everything.
+AES_FIRST_PREFIX = 1_000_000
 MAX_DEFAULT_WORKERS = 64
 RESULT_TARGET = 2
 PLAUSIBLE_SCORE = -15.0
@@ -262,9 +270,38 @@ def _plaintext(data: bytes) -> Optional[str]:
     return text
 
 
+def _valid_padding_block(
+    body: bytes, key: bytes, iv: bytes, spec: CipherSpec
+) -> bool:
+    """Test PKCS#7 padding by decrypting only the final block.
+
+    A wrong passphrase fails padding on almost every guess, so decrypting
+    the whole body first made every guess cost the full ciphertext. CBC
+    decrypts each block independently given the previous ciphertext block,
+    so the last block alone is enough to reject a wrong key.
+    """
+    if spec.stream:
+        return True
+    size = spec.block_size
+    if len(body) < size or len(body) % size:
+        return False
+    last = body[-size:]
+    previous = body[-2 * size:-size] if len(body) >= 2 * size else iv
+    try:
+        block = spec.make(key, previous).decrypt(last)
+    except (ValueError, TypeError):
+        return False
+    pad = block[-1]
+    if not 1 <= pad <= size:
+        return False
+    return pad == 1 or block[-pad:] == bytes([pad]) * pad
+
+
 def _decrypt_with(
     body: bytes, key: bytes, iv: bytes, label: str, spec: CipherSpec
 ) -> Optional[Tuple[str, str]]:
+    if not _valid_padding_block(body, key, iv, spec):
+        return None
     try:
         data = spec.make(key, iv).decrypt(body)
         if not spec.stream:
@@ -316,8 +353,18 @@ class LegacyAttempt:
         """Number of cipher/KDF decryptions tried per passphrase."""
         return 2 * len(self.ciphers)
 
+    @property
+    def aes_ciphers(self) -> Tuple[CipherSpec, ...]:
+        """The AES variants, which `openssl enc` uses by default."""
+        return tuple(
+            spec for spec in self.ciphers if spec.label.startswith("AES-")
+        )
+
     def try_digest(
-        self, passphrase: Union[str, bytes], digest: str
+        self,
+        passphrase: Union[str, bytes],
+        digest: str,
+        ciphers: Optional[Tuple[CipherSpec, ...]] = None,
     ) -> Optional[Tuple[str, str]]:
         """Try one password with one digest across every fixed cipher."""
         password = (
@@ -325,7 +372,8 @@ class LegacyAttempt:
             if isinstance(passphrase, str)
             else passphrase
         )
-        ciphers = self.ciphers
+        if ciphers is None:
+            ciphers = self.ciphers
         salt = self.salt
         body = self.body
         material = _evp_material(
@@ -392,9 +440,12 @@ _WORKER_ATTEMPT: Optional[LegacyAttempt] = None
 _WORKER_STOP = None
 
 
-def _parallel_worker_init(token_text: str, stop) -> None:
+def _parallel_worker_init(
+    token_text: str, stop, priority: str = "background"
+) -> None:
     """Build the parsed attempt once in each spawned worker."""
     global _WORKER_ATTEMPT, _WORKER_STOP
+    lower_priority(priority)
     _WORKER_ATTEMPT = prepare_legacy_attempt(token_text)
     _WORKER_STOP = stop
 
@@ -415,17 +466,23 @@ def _mark_hit(chunk_index: int) -> None:
             _WORKER_STOP.value = chunk_index
 
 
-def _dictionary_worker_init(token_text: str) -> None:
+def _dictionary_worker_init(
+    token_text: str, priority: str = "background"
+) -> None:
     global _WORKER_ATTEMPT
+    lower_priority(priority)
     _WORKER_ATTEMPT = prepare_legacy_attempt(token_text)
 
 
 def _dictionary_parallel_worker(payload):
     """Scan a whole chunk and return every plausible hit in it."""
-    digest, chunk_index, passwords = payload
+    digest, chunk_index, passwords, aes_only = payload
+    attempt = _WORKER_ATTEMPT
+    ciphers = attempt.aes_ciphers if aes_only else attempt.ciphers
+    try_digest = attempt.try_digest
     hits = []
     for password in passwords:
-        hit = _WORKER_ATTEMPT.try_digest(password, digest)
+        hit = try_digest(password, digest, ciphers)
         if hit is None:
             continue
         candidate = _candidate_for_hit(password, hit[0], hit[1])
@@ -458,6 +515,7 @@ def parallel_incremental_attack(
     state_path,
     workers: int,
     progress=None,
+    priority: str = "background",
 ):
     """Run the generic parallel incremental engine on an OpenSSL blob."""
     from .incremental import parallel_incremental_attack as run
@@ -466,7 +524,7 @@ def parallel_incremental_attack(
         state,
         token_text,
         state_path,
-        _parallel_worker_init,
+        partial(_parallel_worker_init, priority=priority),
         _incremental_parallel_worker,
         workers,
         progress=progress,
@@ -612,15 +670,35 @@ def _add_candidate(
     return True
 
 
+def _scan_phases(
+    attempt: LegacyAttempt, total: int
+) -> Iterator[Tuple[str, str, Optional[Tuple[CipherSpec, ...]], int]]:
+    """Yield ``(digest, label, aes_ciphers_or_None, limit)`` scan phases.
+
+    AES-only phases run over the common prefix first, where a real passphrase
+    is most likely to appear; the later all-cipher phases keep full coverage
+    of the legacy ciphers and the rest of the list.
+    """
+    aes = attempt.aes_ciphers
+    if aes:
+        limit = min(total, AES_FIRST_PREFIX)
+        for digest in LEGACY_GUESS_DIGESTS:
+            yield digest, f"{_digest_label(digest)} \u00b7 AES first", aes, limit
+    for digest in LEGACY_GUESS_DIGESTS:
+        yield digest, _digest_label(digest), None, total
+
+
 def _dictionary_attack_parallel(
+    attempt: LegacyAttempt,
     token_text: str,
     wordlist_factory: Callable[[], Iterable[Union[str, bytes]]],
     total: int,
     top: int,
     progress: Optional[Callable[[int, int, str], None]],
     workers: int,
+    priority: str = "background",
 ) -> List[Candidate]:
-    """Run digest phases over a streamed wordlist in spawned workers.
+    """Run digest/cipher phases over a streamed wordlist in spawned workers.
 
     A few chunks are in flight at once. Workers return every plausible hit in
     their chunk, and the parent keeps scanning until two results or the tier is
@@ -634,17 +712,18 @@ def _dictionary_attack_parallel(
         max_workers=max(1, workers),
         mp_context=context,
         initializer=_dictionary_worker_init,
-        initargs=(token_text,),
+        initargs=(token_text, priority),
     )
     pending = deque()
     try:
-        for digest, label in (("md5", "MD5"), ("sha256", "SHA-256")):
+        for digest, label, aes_ciphers, limit in _scan_phases(attempt, total):
             pending.clear()
             if progress:
-                progress(0, total, label)
-            stream = _iter_chunks(wordlist_factory())
+                progress(0, limit, label)
+            stream = _iter_chunks(islice(wordlist_factory(), limit))
             next_index = 0
             done = 0
+            aes_only = aes_ciphers is not None
 
             def submit_one() -> bool:
                 nonlocal next_index
@@ -654,7 +733,7 @@ def _dictionary_attack_parallel(
                     return False
                 job = executor.submit(
                     _dictionary_parallel_worker,
-                    (digest, next_index, chunk),
+                    (digest, next_index, chunk, aes_only),
                 )
                 pending.append((next_index, len(chunk), job))
                 next_index += 1
@@ -671,7 +750,7 @@ def _dictionary_attack_parallel(
                 for candidate in hits:
                     _add_candidate(matches, seen, candidate)
                 if progress:
-                    progress(min(done, total), total, label)
+                    progress(min(done, limit), limit, label)
                 if len(matches) >= target:
                     for _index, _size, later in pending:
                         later.cancel()
@@ -685,17 +764,16 @@ def _dictionary_attack_parallel(
 
 
 def _dictionary_attack_serial(
-    salt: bytes,
-    body: bytes,
+    attempt: LegacyAttempt,
     wordlist_factory: Callable[[], Iterable[Union[str, bytes]]],
     total: int,
     top: int,
     progress: Optional[Callable[[int, int, str], None]],
 ) -> List[Candidate]:
-    step = max(1, total // 20)
-    candidates = _legacy_ciphers(body)
+    body = attempt.body
     material_length = max(
-        (spec.key_length + spec.iv_length for spec in candidates), default=0
+        (spec.key_length + spec.iv_length for spec in attempt.ciphers),
+        default=0,
     )
 
     # Fast path: EVP_BytesToKey with MD5 and SHA-256. RC4 is excluded: it is
@@ -705,18 +783,22 @@ def _dictionary_attack_serial(
     target = _result_target(top)
     matches: List[Candidate] = []
     seen = set()
-    for digest in LEGACY_GUESS_DIGESTS:
-        label = _digest_label(digest)
+    for digest, label, aes_ciphers, limit in _scan_phases(attempt, total):
+        ciphers = aes_ciphers or attempt.ciphers
+        digest_label = _digest_label(digest)
+        step = max(1, limit // 20)
         if progress:
-            progress(0, total, label)
+            progress(0, limit, label)
         for index, word in enumerate(wordlist_factory(), 1):
+            if index > limit:
+                break
             password = _as_passphrase_bytes(word)
             if not password:
                 continue
             material = _evp_material(
-                password, salt, material_length, digest
+                password, attempt.salt, material_length, digest
             )
-            for spec in candidates:
+            for spec in ciphers:
                 key = material[:spec.key_length]
                 iv = material[
                     spec.key_length:spec.key_length + spec.iv_length
@@ -725,7 +807,7 @@ def _dictionary_attack_serial(
                     body,
                     key,
                     iv,
-                    f"OpenSSL {spec.label} ({label})",
+                    f"OpenSSL {spec.label} ({digest_label})",
                     spec,
                 )
                 if hit:
@@ -733,10 +815,10 @@ def _dictionary_attack_serial(
                     _add_candidate(matches, seen, candidate)
                     if len(matches) >= target:
                         if progress:
-                            progress(min(index, total), total, label)
+                            progress(min(index, limit), limit, label)
                         return _rank_candidates(matches, top)
-            if progress and (index % step == 0 or index == total):
-                progress(min(index, total), total, label)
+            if progress and (index % step == 0 or index >= limit):
+                progress(min(index, limit), limit, label)
     return _rank_candidates(matches, top)
 
 
@@ -747,15 +829,17 @@ def dictionary_attack_stream(
     top: int = 2,
     progress: Optional[Callable[[int, int, str], None]] = None,
     workers: int = 1,
+    priority: str = "background",
 ) -> List[Candidate]:
     """Try a streamed wordlist against an OpenSSL salted blob.
 
-    ``wordlist_factory`` is called once per KDF phase, so tiered files are
-    reopened instead of kept in memory. ``total`` is the number of candidates
-    from the manifest (or a counted custom file) and is used for progress.
+    ``wordlist_factory`` is called once per digest/cipher phase, so tiered
+    files are reopened instead of kept in memory. ``total`` is the number of
+    candidates from the manifest (or a counted custom file) and is used for
+    progress.
     """
     try:
-        salt, body = _split(token_text)
+        attempt = prepare_legacy_attempt(token_text)
     except OpenSSLError:
         return []
     if total <= 0:
@@ -763,10 +847,17 @@ def dictionary_attack_stream(
     workers = max(1, workers)
     if workers > 1 and total >= PARALLEL_MIN_PASSPHRASES:
         return _dictionary_attack_parallel(
-            token_text, wordlist_factory, total, top, progress, workers
+            attempt,
+            token_text,
+            wordlist_factory,
+            total,
+            top,
+            progress,
+            workers,
+            priority,
         )
     return _dictionary_attack_serial(
-        salt, body, wordlist_factory, total, top, progress
+        attempt, wordlist_factory, total, top, progress
     )
 
 
@@ -776,6 +867,7 @@ def dictionary_attack(
     top: int = 2,
     progress: Optional[Callable[[int, int, str], None]] = None,
     workers: int = 1,
+    priority: str = "background",
 ) -> List[Candidate]:
     """Try an in-memory wordlist against an OpenSSL salted blob.
 
@@ -800,4 +892,5 @@ def dictionary_attack(
         top=top,
         progress=progress,
         workers=workers,
+        priority=priority,
     )

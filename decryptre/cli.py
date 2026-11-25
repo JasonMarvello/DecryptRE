@@ -18,6 +18,7 @@ from . import (
     modern_crypto,
     openssl_compat,
     present,
+    resources,
     wordlist as wordlists,
     xor,
 )
@@ -157,7 +158,8 @@ class OpenSSLScanStatus:
             print(
                 f"{self.prefix}Trying {total:,} passphrases against the "
                 f"OpenSSL blob with OpenSSL's legacy key derivation "
-                f"(MD5, then SHA-256)...",
+                f"(AES ciphers first over the common list, then every "
+                f"cipher; MD5 then SHA-256)...",
                 file=self.stream,
                 flush=True,
             )
@@ -514,6 +516,7 @@ def _incremental_decrypt(text: str, args) -> List[Candidate]:
                 state_path,
                 workers,
                 progress=IncrementalStatus(),
+                priority=args.priority,
             )
         else:
             result = incremental.incremental_attack(
@@ -632,6 +635,10 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
                 if args.workers is not None
                 else openssl_compat.default_workers()
             )
+            if args.wordlist_tier in resources.MEMORY_WARNING_TIERS:
+                warning = resources.memory_warning(args.wordlist_tier, workers)
+                if warning:
+                    print(warning, file=sys.stderr)
             results = openssl_compat.dictionary_attack_stream(
                 text,
                 factory,
@@ -639,6 +646,7 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
                 top=args.top,
                 progress=OpenSSLScanStatus(),
                 workers=workers,
+                priority=args.priority,
             )
             if not results:
                 raise SystemExit(
@@ -714,6 +722,10 @@ def cmd_decrypt(args) -> int:
             raise SystemExit(
                 "error: --workers only applies to --method openssl"
             )
+
+    if method == "openssl":
+        # Full worker count, but stay out of the way of foreground apps.
+        resources.lower_priority(args.priority)
 
     if args.wordlist and args.wordlist_tier:
         raise SystemExit(
@@ -802,74 +814,87 @@ def cmd_decrypt(args) -> int:
 # encrypt
 # ---------------------------------------------------------------------------
 
+def _emit_ciphertext(output: str, destination: Optional[str]) -> None:
+    """Write ciphertext where terminal line-wrapping cannot corrupt it."""
+    if destination:
+        path = Path(destination).expanduser()
+        try:
+            path.write_text(output + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit(f"error: cannot write {path}: {exc}") from exc
+        print(f"Wrote {len(output)} characters to {path}", file=sys.stderr)
+        return
+    print(output)
+    if sys.stdout.isatty():
+        print(
+            "Note: terminals can wrap long ciphertext when it is copied. "
+            "Re-run with --output FILE and copy from that file for an exact copy.",
+            file=sys.stderr,
+        )
+
+
 def cmd_encrypt(args) -> int:
     method = _normalise_method(args.method)
     text = read_input(args.input)
 
     if method in encodings.ENCODINGS:
-        print(encodings.encode(text, method))
-        return 0
-    if method == "rot13":
-        print(classical.rot13(text))
-        return 0
-    if method == "caesar":
-        print(classical.caesar_encrypt(text, args.shift if args.shift is not None else 3))
-        return 0
-    if method == "atbash":
-        print(classical.atbash(text))
-        return 0
-    if method == "vigenere":
+        output = encodings.encode(text, method)
+    elif method == "rot13":
+        output = classical.rot13(text)
+    elif method == "caesar":
+        output = classical.caesar_encrypt(
+            text, args.shift if args.shift is not None else 3
+        )
+    elif method == "atbash":
+        output = classical.atbash(text)
+    elif method == "vigenere":
         if not args.key:
             raise SystemExit("error: --key is required for Vigenere")
-        print(classical.vigenere_encrypt(text, args.key))
-        return 0
-    if method == "railfence":
+        output = classical.vigenere_encrypt(text, args.key)
+    elif method == "railfence":
         if args.rails is None:
             raise SystemExit("error: --rails is required for Rail Fence")
-        print(classical.railfence_encrypt(text, args.rails))
-        return 0
-    if method == "substitution":
+        output = classical.railfence_encrypt(text, args.rails)
+    elif method == "substitution":
         if not args.key:
-            raise SystemExit("error: --key (26-letter alphabet) is required for substitution")
-        print(classical.substitution_encrypt(text, args.key))
-        return 0
-    if method == "xor":
+            raise SystemExit(
+                "error: --key (26-letter alphabet) is required for substitution"
+            )
+        output = classical.substitution_encrypt(text, args.key)
+    elif method == "xor":
         if not args.key:
             raise SystemExit("error: --key is required for XOR")
-        print(_xor_wrapper(xor.xor_encrypt(text, args.key)))
-        return 0
-    if method == "fernet":
+        output = _xor_wrapper(xor.xor_encrypt(text, args.key))
+    elif method == "fernet":
         if not args.key:
             raise SystemExit("error: --key is required for Fernet")
-        print(modern_crypto.encrypt_fernet(text, args.key, iterations=args.iterations))
-        return 0
-    if method == "aes":
+        output = modern_crypto.encrypt_fernet(
+            text, args.key, iterations=args.iterations
+        )
+    elif method == "aes":
         if not args.key:
             raise SystemExit("error: --key is required for AES")
-        print(
-            modern_crypto.encrypt_aes(
-                text,
-                args.key,
-                mode=args.aes_mode,
-                kdf=args.kdf,
-                iterations=args.iterations,
-            )
+        output = modern_crypto.encrypt_aes(
+            text,
+            args.key,
+            mode=args.aes_mode,
+            kdf=args.kdf,
+            iterations=args.iterations,
         )
-        return 0
-    if method == "des3":
+    elif method == "des3":
         if not args.key:
             raise SystemExit("error: --key is required for 3DES")
-        print(
-            modern_crypto.encrypt_des3(
-                text,
-                args.key,
-                kdf=args.kdf,
-                iterations=args.iterations,
-            )
+        output = modern_crypto.encrypt_des3(
+            text,
+            args.key,
+            kdf=args.kdf,
+            iterations=args.iterations,
         )
-        return 0
+    else:
+        raise SystemExit(f"error: unknown method: {method}")
 
-    raise SystemExit(f"error: unknown method: {method}")
+    _emit_ciphertext(output, args.output)
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1038,16 @@ def build_parser() -> argparse.ArgumentParser:
             "1 disables)"
         ),
     )
+    decrypt.add_argument(
+        "--priority",
+        choices=list(resources.PRIORITY_CHOICES),
+        default="background",
+        help=(
+            "OS scheduling priority for OpenSSL scans: background (default) "
+            "keeps foreground applications responsive at the full worker "
+            "count; normal leaves the process at the shell's priority"
+        ),
+    )
     incremental_options = decrypt.add_argument_group(
         "incremental passphrase search (opt-in, OpenSSL only)"
     )
@@ -1110,6 +1145,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     encrypt.add_argument(
         "--input", required=True, help="file path, literal text, or - to read stdin"
+    )
+    encrypt.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "write the ciphertext to this file instead of the terminal; "
+            "copying from the file avoids terminal line-wrapping"
+        ),
     )
     encrypt.add_argument(
         "--method", required=True, help="encoding or cipher name (see `decryptre methods`)"

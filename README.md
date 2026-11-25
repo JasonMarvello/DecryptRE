@@ -158,6 +158,7 @@ decryptre decrypt --input <file|text|-> [options]
 | `--wordlist-tier` | `medium` | `small`, `medium`, `large`, or generated `5m`/`10m`/`50m`/`100m` for explicit `--method openssl`. `large` adds local RockYou; generated tiers are not shipped as data. |
 | `--no-wordlist` | off | Skip the bundled wordlist. |
 | `--workers N` | available CPUs, capped at 64 | Worker processes for explicit `--method openssl` wordlist and incremental scans. `--workers 1` disables; auto mode stays single-process. |
+| `--priority MODE` | `background` | OS scheduling priority for OpenSSL scans: `background` drops the parent and every worker below normal priority (Windows `BELOW_NORMAL_PRIORITY_CLASS`, `nice 10` elsewhere) without reducing the worker count; `normal` leaves the process at the shell's priority. |
 | `--incremental` | off | Opt-in exhaustive passphrase search for OpenSSL `Salted__` blobs. Requires `--method openssl`; auto mode never starts it. See [Incremental search](#incremental-search-opt-in-exhaustive-passphrase-search). |
 | `--charset NAME` | `lower+upper+digits` | Charset component(s) for `--incremental`: `lower`, `upper`, `digits`, `symbols`, `all`. Repeat to combine. |
 | `--min-length N` | `1` | Shortest passphrase length for `--incremental`. |
@@ -181,7 +182,8 @@ decryptre encrypt --input <file|text|-> --method NAME [options]
 Uses the same method names. `--key` is required for Vigenère, XOR, Fernet and
 AES. Extra options: `--shift` (Caesar, default 3), `--rails` (Rail Fence),
 `--aes-mode gcm|cbc` (default `gcm`), `--kdf pbkdf2|scrypt` (default
-`pbkdf2`), `--iterations` (PBKDF2, default 200000).
+`pbkdf2`), `--iterations` (PBKDF2, default 200000), and `--output FILE` to
+write the ciphertext to a file instead of the terminal.
 
 ### `decryptre methods`
 
@@ -301,6 +303,38 @@ A wrong passphrase raises a clear error instead of printing garbage.
 XOR encryption prints `decryptre:xor:<base64>` for the same reason: it keeps
 the ciphertext safe to copy through a terminal or a text file.
 
+### Copying ciphertext safely
+
+Terminals wrap long lines, and PowerShell in particular re-flows output. The
+ciphertext is not changed, but selecting the wrapped text can insert newlines
+or leading spaces, which corrupts a pasted token. Treat display wrapping as a
+correctness hazard, not a cosmetic one.
+
+Write the ciphertext to a file and copy from there:
+
+```bash
+decryptre encrypt --input "TEXT" --method aes --key "pass" --output ciphertext.txt
+decryptre decrypt --input ciphertext.txt --method aes --key "pass"
+```
+
+Without `--output`, `encrypt` prints a warning when stdout is a terminal. The
+interactive menu offers the same safe save after showing the result.
+
+### Scheduling priority and memory
+
+OpenSSL wordlist and incremental scans use every available CPU (capped at 64)
+at below-normal OS priority by default: Windows `BELOW_NORMAL_PRIORITY_CLASS`
+and `nice 10` elsewhere. The parent process and every worker inherit the
+setting, so a full-throughput scan does not starve foreground applications
+when the machine is otherwise idle. `--priority normal` restores the shell's
+priority.
+
+The 50M and 100M tiers stream their candidates, so memory does not grow with
+the tier size; it scales with the worker count instead, because each worker
+holds an interpreter plus one in-flight chunk. Before a 50M/100M scan,
+DecryptRE compares a rough estimate against available RAM and prints a warning
+when it is tight. It warns rather than blocks; lower `--workers` if it appears.
+
 ---
 
 ## Examples
@@ -356,6 +390,14 @@ The `5m`, `10m`, `50m` and `100m` options are generated on demand; the counts
 include the bundled medium prefix, so they always begin with the common list.
 They add English and personal-name variants first, then the other bundled
 languages. No generated passphrases are stored in the package.
+
+OpenSSL scans are ordered to find real passphrases quickly. The first million
+candidates, which include the bundled common-password list, are tried against
+AES-128/192/256 only — the ciphers `openssl enc` uses by default — and a guess
+costs about 24 µs instead of 100 µs. If that finds nothing, the scan repeats the
+list with every supported cipher (3DES, DES, Blowfish, CAST5 as well), so no
+coverage is lost. Generated candidates beyond the first million are still tried
+against every cipher, as before.
 
 Custom lists are newline-separated. Blank lines and lines whose first character
 is `#` are skipped; leading and trailing spaces are preserved, so a passphrase

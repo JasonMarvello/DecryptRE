@@ -116,6 +116,21 @@ def test_decrypt_flow_prompts_for_a_tier_on_an_openssl_blob(monkeypatch):
     assert seen == {"text": "U2FsdGVkX1...", "key": "", "tier": "5m"}
 
 
+def test_encrypt_flow_offers_to_save_the_exact_ciphertext(tmp_path, monkeypatch):
+    target = tmp_path / "ciphertext.txt"
+    answers = iter(["hello", str(target)])
+
+    monkeypatch.setattr(interactive, "menu", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(interactive, "ask", lambda prompt: next(answers))
+    monkeypatch.setattr(interactive, "show", lambda text: None)
+    monkeypatch.setattr(interactive, "pause", lambda: None)
+
+    interactive.encrypt_flow()
+
+    expected = interactive.encodings.encode("hello", "base64")
+    assert target.read_text(encoding="utf-8") == expected + "\n"
+
+
 def test_decrypt_flow_skips_the_tier_prompt_when_key_is_known(monkeypatch):
     answers = iter(["U2FsdGVkX1...", "secret"])
     seen = {}

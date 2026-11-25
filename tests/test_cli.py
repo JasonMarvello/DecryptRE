@@ -74,3 +74,75 @@ def test_unknown_method_exits():
     with pytest.raises(SystemExit) as excinfo:
         main(["decrypt", "--input", "text", "--method", "nonsense"])
     assert "unknown method" in str(excinfo.value)
+
+
+def test_encrypt_output_file_roundtrips_through_decrypt(tmp_path, capsys):
+    target = tmp_path / "ciphertext.txt"
+    code = main(
+        [
+            "encrypt",
+            "--input",
+            MESSAGE,
+            "--method",
+            "aes",
+            "--key",
+            "opensesame",
+            "--iterations",
+            "1000",
+            "--output",
+            str(target),
+        ]
+    )
+
+    assert code == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    token = target.read_text(encoding="utf-8")
+    assert token.endswith("\n") and token.count("\n") == 1
+
+    plain = run(
+        capsys,
+        ["decrypt", "--input", str(target), "--method", "aes", "--key", "opensesame"],
+    )
+    assert MESSAGE in plain
+
+
+def test_encrypt_output_file_is_not_wrapped_by_the_terminal(tmp_path):
+    long_text = "A" * 5000
+    target = tmp_path / "long.txt"
+
+    assert main(
+        [
+            "encrypt",
+            "--input",
+            long_text,
+            "--method",
+            "base64",
+            "--output",
+            str(target),
+        ]
+    ) == 0
+
+    written = target.read_text(encoding="utf-8")
+    assert written == _base64(long_text) + "\n"
+
+
+def _base64(text):
+    import base64
+
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def test_priority_flag_is_documented_and_validated(capsys):
+    with pytest.raises(SystemExit):
+        main(["decrypt", "--help"])
+    assert "--priority" in capsys.readouterr().out
+
+    with pytest.raises(SystemExit):
+        main(["decrypt", "--input", "hello", "--priority", "nonsense"])
+
+
+def test_encrypt_help_documents_output(capsys):
+    with pytest.raises(SystemExit):
+        main(["encrypt", "--help"])
+    assert "--output" in capsys.readouterr().out

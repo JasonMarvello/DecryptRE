@@ -13,6 +13,7 @@ import shutil
 import sys
 import textwrap
 import unicodedata
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from . import (
@@ -22,6 +23,7 @@ from . import (
     modern_crypto,
     openssl_compat,
     present,
+    resources,
     wordlist as wordlists,
     xor,
 )
@@ -444,13 +446,19 @@ def _scan_openssl_tier(
             f"  Scanning the {tier} tier ({total:,} passphrases)...",
             flush=True,
         )
+    workers = openssl_compat.default_workers()
+    warning = resources.memory_warning(tier, workers)
+    if warning:
+        print(f"  {warning}", flush=True)
+    resources.lower_priority("background")
     return openssl_compat.dictionary_attack_stream(
         text,
         factory,
         total,
         top=2,
         progress=OpenSSLScanStatus(stream=sys.stdout, prefix="  "),
-        workers=openssl_compat.default_workers(),
+        workers=workers,
+        priority="background",
     )
 
 
@@ -593,6 +601,18 @@ def encrypt_flow() -> None:
 
     print("\n  Ciphertext:\n")
     show(output)
+    destination = ask(
+        "Save the exact ciphertext to a file? (path, blank to skip):"
+    )
+    if destination:
+        target = Path(destination).expanduser()
+        try:
+            target.write_text(output + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"  Could not save: {exc}")
+        else:
+            print(f"  Saved {len(output)} characters to {target}")
+            print("  Copy from the file; terminal wrapping is not preserved there.")
     pause()
 
 
@@ -624,6 +644,7 @@ def help_screen() -> None:
     decryptre decrypt --input token.txt --method des3 --key "pass"
     decryptre decrypt --input "U2FsdGVkX1..." --key "pass"   # OpenSSL blob
     decryptre encrypt --input "TEXT" --method aes --key "pass"
+    decryptre encrypt --input "TEXT" --method aes --key "pass" --output out.txt
     decryptre identify --input "5d41402abc4b2a76b9719d911017c592"
     decryptre methods                                every method and example
     decryptre --help                                 full reference
@@ -635,6 +656,10 @@ def help_screen() -> None:
       cipher verifies the passphrase, so the result is marked high confidence.
     * For OpenSSL blobs without a passphrase, the UI asks for a wordlist tier
       from 10,001 entries through the generated 100M tier.
+    * Use --output FILE when encrypting: terminals wrap long tokens, and a
+      copy from the file is always exact.
+    * OpenSSL scans run below normal priority at full worker count; pass
+      --priority normal if you want them to compete with other apps.
     * Only DecryptRE (decryptre:v1:) containers can be opened this way.
     * 3DES exists for legacy data only; do not encrypt new data with it.
     * --top 10 shows more results; --max-depth 4 peels more layers.
