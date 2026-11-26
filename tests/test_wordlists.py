@@ -133,10 +133,10 @@ def test_generated_seed_variants_are_deterministic_and_unique():
 
     assert first == second
     assert first == [
+        b"patty",
+        b"Patty",
+        b"PATTY",
         b"patty000000",
-        b"Patty000000",
-        b"PATTY000000",
-        b"patty000001",
     ]
 
 
@@ -230,3 +230,160 @@ def test_corrupt_large_gzip_reports_wordlist_error(monkeypatch, tmp_path):
 
     with pytest.raises(wordlist.WordlistError, match="cannot read wordlist"):
         list(wordlist.iter_tier("large"))
+
+
+def test_case_forms_add_capitalised_and_upper_only():
+    assert wordlist.case_forms(b"love") == [b"love", b"Love", b"LOVE"]
+    assert wordlist.case_forms(b"Love") == [b"Love", b"LOVE"]
+    assert wordlist.case_forms(b"LOVE") == [b"LOVE"]
+    assert wordlist.case_forms(b"123456") == [b"123456"]
+
+
+def test_case_forms_leave_non_ascii_untouched():
+    word = "привет".encode("utf-8")
+    assert wordlist.case_forms(word) == [word]
+
+
+def test_iter_case_variants_off_is_a_pass_through():
+    words = [b"love", b"Love"]
+    assert list(wordlist.iter_case_variants(iter(words), "off")) == words
+
+
+def test_iter_case_variants_common_expands_only_the_prefix():
+    expanded = list(
+        wordlist.iter_case_variants(iter([b"alpha", b"beta", b"gamma"]), "common", 2)
+    )
+
+    assert expanded == [
+        b"alpha",
+        b"Alpha",
+        b"ALPHA",
+        b"beta",
+        b"Beta",
+        b"BETA",
+        b"gamma",
+    ]
+
+
+def test_iter_case_variants_all_expands_enough_to_cover_generated_tiers():
+    expanded = list(
+        wordlist.iter_case_variants(iter([b"alpha", b"beta"]), "all", 1)
+    )
+
+    assert expanded[-3:] == [b"beta", b"Beta", b"BETA"]
+
+
+def test_case_variant_count_matches_the_prefix_rule():
+    assert wordlist.case_variant_count(10, "off") == 10
+    assert wordlist.case_variant_count(10, "all") == 30
+    assert wordlist.case_variant_count(1_368_353, "common", 10_001) == (
+        1_368_353 + 20_002
+    )
+
+
+def test_generated_tier_tries_bare_seed_forms_first():
+    assert list(wordlist._iter_seed_variants([b"patty"], 3)) == [
+        b"patty",
+        b"Patty",
+        b"PATTY",
+    ]
+
+
+def test_mutation_forms_off_keeps_the_bare_candidate():
+    assert wordlist.mutation_forms(b"love", "off") == [b"love"]
+
+
+def test_mutation_forms_numbers_append_each_digit_after_the_bare_word():
+    forms = wordlist.mutation_forms(b"love", "numbers")
+
+    assert forms[0] == b"love"
+    assert forms[1:] == [b"love" + tail for tail in wordlist._DIGIT_TAILS]
+    assert len(forms) == 11
+
+
+def test_mutation_forms_symbols_add_punctuation_and_digit_symbol_tails():
+    forms = wordlist.mutation_forms(b"love", "symbols")
+
+    assert b"love!" in forms
+    assert b"love123!" in forms
+    assert b"love12" not in forms
+    assert len(set(forms)) == len(forms)
+
+
+def test_mutation_forms_common_adds_runs_years_and_leading_zero_numbers():
+    forms = wordlist.mutation_forms(b"love", "common")
+
+    assert b"love123" in forms
+    assert b"love007" in forms
+    assert b"love1999" in forms
+    assert len(forms) == 1 + wordlist.mutation_factor("common")
+
+
+def test_mutation_forms_all_adds_leet_and_stays_unique():
+    forms = wordlist.mutation_forms(b"love", "all")
+
+    assert b"l0ve" in forms
+    assert b"l0v3" in forms
+    # "love" has two substitutable letters, so three leet forms; the factor is
+    # an upper bound for words with six or more.
+    assert len(forms) == 194
+    assert len(forms) <= 1 + wordlist.mutation_factor("all")
+    assert len(set(forms)) == len(forms)
+
+
+def test_leet_forms_are_bounded_for_long_words():
+    # Only the first six substitutable positions get one- and two-letter
+    # substitutions, which keeps the multiplier predictable.
+    forms = wordlist._leet_forms(b"assessmentsassessments")
+
+    assert len(forms) <= wordlist._LEET_MAX_FORMS
+    assert wordlist.mutation_factor("all") == 190 + wordlist._LEET_MAX_FORMS
+
+
+def test_mutation_forms_leave_non_ascii_unchanged():
+    word = "\u043f\u0440\u0438\u0432\u0435\u0442".encode("utf-8")
+
+    assert wordlist.mutation_forms(word, "all") == [word]
+
+
+def test_unknown_mutation_mode_is_rejected():
+    with pytest.raises(wordlist.WordlistError, match="unknown mutation mode"):
+        wordlist.mutation_forms(b"love", "leet")
+
+
+def test_mutation_factor_counts_distinct_tails_only():
+    assert wordlist.mutation_factor("off") == 0
+    assert wordlist.mutation_factor("numbers") == 10
+    assert wordlist.mutation_factor("symbols") == 17
+    # "69" is already in the 00-99 group, so it is counted once.
+    assert wordlist.mutation_factor("common") == 188
+    assert wordlist.mutation_factor("all") == 190 + wordlist._LEET_MAX_FORMS
+
+
+def test_iter_expansions_applies_case_and_mutation_to_the_same_candidate():
+    expanded = list(
+        wordlist.iter_expansions(iter([b"alpha", b"beta"]), "common", "numbers", 1)
+    )
+
+    assert expanded[:12] == [
+        b"alpha",
+        *[b"alpha" + tail for tail in wordlist._DIGIT_TAILS],
+        b"Alpha",
+    ]
+    assert expanded[-1] == b"beta"
+    assert len(expanded) == wordlist.expansion_count(
+        2, "common", "numbers", 1
+    )
+
+
+def test_iter_expansions_without_a_prefix_expands_a_custom_list_fully():
+    expanded = list(
+        wordlist.iter_expansions(iter([b"love", b"mine"]), "common", "off")
+    )
+
+    assert expanded == [b"love", b"Love", b"LOVE", b"mine", b"Mine", b"MINE"]
+
+
+def test_iter_expansions_off_is_a_pass_through():
+    words = [b"love", b"Love"]
+    assert list(wordlist.iter_expansions(iter(words), "off", "off")) == words

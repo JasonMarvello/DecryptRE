@@ -155,10 +155,12 @@ decryptre decrypt --input <file|text|-> [options]
 | `--shift N` | try all | Caesar shift. |
 | `--rails N` | try 2-12 | Rail Fence rails. |
 | `--wordlist PATH` | bundled list | Passphrase list for Fernet/AES/3DES. Replaces the bundled tiers. |
-| `--wordlist-tier` | `medium` | `small`, `medium`, `large`, or generated `5m`/`10m`/`50m`/`100m` for explicit `--method openssl`. `large` adds local RockYou; generated tiers are not shipped as data. |
+| `--wordlist-tier` | `medium` (OpenSSL), `small` (AES/Fernet/3DES) | `small`, `medium`, `large`, or generated `5m`/`10m`/`50m`/`100m` for explicit `--method openssl`, `aes`, `fernet` or `des3` scans. `large` adds local RockYou; generated tiers are not shipped as data. |
+| `--case-variants` | `common` | For explicit `--method` scans, also try the Capitalised and UPPERCASE form of each wordlist entry. `off` uses every list exactly as written, `common` expands the small tier and custom `--wordlist` files, `all` expands every tier (about three times the work). |
+| `--mutations` | `numbers` (OpenSSL), `off` (AES/Fernet/3DES) | Also try each wordlist entry with digits and symbols appended: `off` never mutates, `numbers` adds a trailing digit, `symbols` adds punctuation and short digit+symbol tails, `common` adds `00`-`99`, short runs and years, `all` adds bounded leetspeak and doubled symbols. See [Numbers and symbols](#numbers-and-symbols). |
 | `--no-wordlist` | off | Skip the bundled wordlist. |
-| `--workers N` | available CPUs, capped at 64 | Worker processes for explicit `--method openssl` wordlist and incremental scans. `--workers 1` disables; auto mode stays single-process. |
-| `--priority MODE` | `background` | OS scheduling priority for OpenSSL scans: `background` drops the parent and every worker below normal priority (Windows `BELOW_NORMAL_PRIORITY_CLASS`, `nice 10` elsewhere) without reducing the worker count; `normal` leaves the process at the shell's priority. |
+| `--workers N` | available CPUs, capped at 64 | Worker processes for explicit `openssl`, `aes`, `fernet` and `des3` wordlist scans, plus OpenSSL incremental scans. `--workers 1` disables; auto mode stays single-process. |
+| `--priority MODE` | `background` | OS scheduling priority for explicit wordlist scans: `background` drops the parent and every worker below normal priority (Windows `BELOW_NORMAL_PRIORITY_CLASS`, `nice 10` elsewhere) without reducing the worker count; `normal` leaves the process at the shell's priority. |
 | `--incremental` | off | Opt-in exhaustive passphrase search for OpenSSL `Salted__` blobs. Requires `--method openssl`; auto mode never starts it. See [Incremental search](#incremental-search-opt-in-exhaustive-passphrase-search). |
 | `--charset NAME` | `lower+upper+digits` | Charset component(s) for `--incremental`: `lower`, `upper`, `digits`, `symbols`, `all`. Repeat to combine. |
 | `--min-length N` | `1` | Shortest passphrase length for `--incremental`. |
@@ -386,6 +388,90 @@ with it, with `--key`, `--incremental`, or `--no-wordlist`. Auto mode stays on
 `small` and rejects the tier option, so an ordinary decode never turns into a
 multi-minute scan.
 
+### Case variants
+
+The bundled lists are lowercase. That is why `love` opens a blob whose
+passphrase is `love`, while `Love` and `LOVE` are not in the list at all.
+`--case-variants` (default `common`) fixes that without shipping a bigger
+file: every candidate is tried as written, with its first letter capitalised
+and in full uppercase. Non-ASCII entries are left untouched because changing
+their case would not reproduce what the user typed.
+
+```bash
+decryptre decrypt --input blob.txt --method openssl --wordlist-tier small
+decryptre decrypt --input blob.txt --method openssl --case-variants off
+```
+
+`common` expands the small tier and custom `--wordlist` files; when a larger
+tier is used, its first 10,001 entries (the small tier is its prefix) get the
+extra forms. `all` expands every tier and roughly triples the scan, so the
+CLI says so before starting. `off` reproduces the previous behaviour exactly.
+Forms are deduplicated per candidate only, so a list that contains both `love`
+and `Love` scans a duplicate instead of holding a huge seen-set in memory.
+The generated `5m`–`100m` tiers now include the bare seed forms
+(`Patty`, `PATTY`) before their numbered variants, with the tier counts
+unchanged.
+
+### Numbers and symbols
+
+Real passphrases are rarely a bare dictionary word: `love` becomes `love1`,
+`Love123`, `love!` or `l0ve`, and none of those is in a bundled list.
+`--mutations` appends a bounded set of endings to each wordlist entry; `off`
+uses the list exactly as written.
+
+| Mode | Endings added | Per word | Small tier with default case variants |
+| --- | --- | --- | --- |
+| `numbers` | `0`-`9` | 11 | 330,033 |
+| `symbols` | `!@#$%&*._-?+`, `1!`, `12!`, `123!`, `1.`, `123.` | 18 | 540,054 |
+| `common` | `00`-`99`, `123`, `1234`, `12345`, `007`, `69`, years `1970`-`2026`, and the symbol endings | 189 | 5,670,567 |
+| `all` | `common`, plus one- and two-position leetspeak on the first six substitutable letters and `!!`/`123!!` | 263 | 7,890,789 |
+
+`numbers` is the default for `--method openssl`, because a trailing digit is
+the most common way a real password extends a word. It multiplies a small-tier
+scan by eleven; `--mutations off` restores the plain list. AES, Fernet and
+3DES scans default to `off`: each guess pays a full key derivation, so a
+mutation matrix takes hours there. The CLI prints a one-line hint naming the
+flag, and any mode can be chosen explicitly.
+
+```bash
+# Default: the small tier, case variants and a trailing digit.
+decryptre decrypt --input blob.txt --method openssl --wordlist-tier small
+
+# Symbols, which also tries "love!" and "love123!".
+decryptre decrypt --input blob.txt --method openssl --mutations symbols
+
+# Plain list, exactly as written.
+decryptre decrypt --input blob.txt --method openssl --mutations off
+```
+
+Measured on the development machine with 8 workers against an AES-256-CBC
+blob: the default small-tier scan (330,033 candidates) took 35 s,
+`--mutations off` (30,003 candidates) 20 s, and `--mutations symbols`
+(540,054 candidates) 43 s. A scan that finds one passphrase still runs to the
+end of the list looking for a second plausible result, so the list length, not
+the position of the hit, sets the cost. One AES-256-GCM word with
+`--mutations common` (189 guesses) took about 7 s on a single worker, roughly
+39 ms per guess.
+
+Mutations and case variants share the same prefix rule: `common` expands the
+small tier and custom `--wordlist` files while a larger tier keeps its
+remaining entries unchanged, and `all` expands every tier. The two multiply,
+so choose them deliberately on a large list; the CLI prints the resulting
+upper bound before scanning. Non-ASCII entries get no endings at all, because
+the tail sets are calibrated for ASCII passwords. Leetspeak is limited to six
+positions and two substitutions, which keeps its multiplier bounded.
+
+### Modern containers
+
+Fernet, AES-256-GCM, AES-256-CBC and 3DES-CBC scans use the same tiers: `small`
+by default, or any `--wordlist-tier`. Each guess pays for the container's key
+derivation, which is thousands of times more expensive than an OpenSSL guess,
+so the command times one real decryption of that container and prints an
+estimate before scanning, and `--workers` splits the list across processes.
+AES-256-GCM and Fernet are authenticated: a matching passphrase is proof, not
+a guess. `identify` reports the algorithm, and `encrypt --aes-mode gcm` (the
+default) produces such a container.
+
 The `5m`, `10m`, `50m` and `100m` options are generated on demand; the counts
 include the bundled medium prefix, so they always begin with the common list.
 They add English and personal-name variants first, then the other bundled
@@ -520,6 +606,13 @@ SHA-256) across AES-128/192/256-CBC, 3DES-CBC, DES-CBC, Blowfish-CBC and
 CAST5-CBC. RC4 is excluded, as in the dictionary path. `-pbkdf2` blobs
 still require `--key`, because 10,000 KDF iterations per guess would make
 the estimate meaningless.
+
+Because it is exhaustive inside its bounds, `--incremental` already reaches
+digits and symbols the charset contains, and the wordlist mutation modes do
+not apply to it. The default charset is `lower+upper+digits`, which has no
+punctuation: add `--charset symbols` (or `--charset all`) when the passphrase
+may end in `!` or `.`, and raise `--max-length` when the punctuation is not
+the last character.
 
 ### Cost is exponential
 

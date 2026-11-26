@@ -163,7 +163,10 @@ METHODS: List[Dict[str, Any]] = [
         "decrypt": "dictionary attack only",
         "auto": "containers only",
         "key": "passphrase",
-        "what": "AES-256 in GCM (default) or CBC mode; PBKDF2 or scrypt.",
+        "what": (
+            "AES-256 in GCM (default, authenticated: the tag proves the "
+            "passphrase) or CBC mode; PBKDF2 or scrypt."
+        ),
         "example": 'decryptre decrypt --input "decryptre:v1:..." --method aes --key "pass"',
     },
     {

@@ -31,6 +31,7 @@ from Crypto.Util.Padding import unpad
 from .models import Candidate
 from .resources import lower_priority
 from .scorer import printable_ratio, score_text
+from .wordlist import expansion_count, iter_expansions
 
 try:  # cryptography >= 43 keeps these legacy ciphers in ``decrepit``.
     from cryptography.hazmat.decrepit.ciphers.algorithms import (
@@ -830,6 +831,9 @@ def dictionary_attack_stream(
     progress: Optional[Callable[[int, int, str], None]] = None,
     workers: int = 1,
     priority: str = "background",
+    case_variants: str = "off",
+    case_variant_prefix: Optional[int] = None,
+    mutations: str = "off",
 ) -> List[Candidate]:
     """Try a streamed wordlist against an OpenSSL salted blob.
 
@@ -844,6 +848,11 @@ def dictionary_attack_stream(
         return []
     if total <= 0:
         return []
+    if case_variants != "off" or mutations != "off":
+        base_factory = wordlist_factory
+        wordlist_factory = lambda: iter_expansions(  # noqa: E731
+            base_factory(), case_variants, mutations, case_variant_prefix
+        )
     workers = max(1, workers)
     if workers > 1 and total >= PARALLEL_MIN_PASSPHRASES:
         return _dictionary_attack_parallel(
@@ -868,6 +877,8 @@ def dictionary_attack(
     progress: Optional[Callable[[int, int, str], None]] = None,
     workers: int = 1,
     priority: str = "background",
+    case_variants: str = "off",
+    mutations: str = "off",
 ) -> List[Candidate]:
     """Try an in-memory wordlist against an OpenSSL salted blob.
 
@@ -885,10 +896,13 @@ def dictionary_attack(
     if not passwords:
         return []
     frozen = tuple(passwords)
+    total = expansion_count(len(frozen), case_variants, mutations)
     return dictionary_attack_stream(
         token_text,
         lambda: iter(frozen),
-        len(frozen),
+        total,
+        case_variants=case_variants,
+        mutations=mutations,
         top=top,
         progress=progress,
         workers=workers,

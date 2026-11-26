@@ -562,6 +562,62 @@ def _incremental_decrypt(text: str, args) -> List[Candidate]:
 # decrypt
 # ---------------------------------------------------------------------------
 
+def _format_duration(seconds: float) -> str:
+    """Short, human duration such as ``4m 20s``."""
+    seconds = int(seconds + 0.5)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _wordlist_detail(
+    total: int,
+    case_mode: str = "off",
+    mutation_mode: str = "off",
+    prefix: Optional[int] = None,
+) -> str:
+    """Candidate count as searched, naming the expansions that apply."""
+    if case_mode == "off" and mutation_mode == "off":
+        return f"{total:,} candidates"
+    expanded = wordlists.expansion_count(total, case_mode, mutation_mode, prefix)
+    labels = []
+    if case_mode != "off":
+        labels.append(f"case variants {case_mode}")
+    if mutation_mode != "off":
+        labels.append(f"mutations {mutation_mode}")
+    return (
+        f"{total:,} base candidates, up to {expanded:,} with "
+        + " and ".join(labels)
+    )
+
+
+def _mutations_for(args, method: str) -> str:
+    """Explicit ``--mutations``, else a method-appropriate default."""
+    if getattr(args, "mutations", None) is not None:
+        return args.mutations
+    return "numbers" if method == "openssl" else "off"
+
+
+def _modern_wordlist_source(args):
+    """Name, count, streaming factory and case-expansion prefix for a scan."""
+    if args.wordlist:
+        source = Path(args.wordlist)
+        return (
+            f"wordlist {source.name}",
+            wordlists.count_file(source),
+            lambda: wordlists.iter_file(source),
+            None,
+        )
+    tier = args.wordlist_tier or "small"
+    count = wordlists.tier_count(tier)
+    prefix = wordlists.tier_count("small") if tier != "small" else None
+    return f"{tier} tier", count, lambda: wordlists.iter_tier(tier), prefix
+
+
 def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
     if method in encodings.ENCODINGS:
         plain = encodings.decode(text, method)
@@ -615,6 +671,7 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
                 raise SystemExit(
                     "error: OpenSSL blobs need --key (no wordlist loaded)"
                 )
+            prefix = None
             try:
                 if args.wordlist:
                     source = Path(args.wordlist)
@@ -624,17 +681,43 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
                     tier = args.wordlist_tier or "medium"
                     total = wordlists.tier_count(tier)
                     factory = lambda: wordlists.iter_tier(tier)
+                    if tier != "small":
+                        prefix = wordlists.tier_count("small")
             except wordlists.WordlistError as exc:
                 raise SystemExit(f"error: {exc}") from exc
             if not total:
                 raise SystemExit(
                     "error: OpenSSL blobs need --key (no wordlist loaded)"
                 )
+            mutations = _mutations_for(args, "openssl")
+            if args.case_variants != "off" or mutations != "off":
+                print(
+                    f"note: this scan tries "
+                    f"{_wordlist_detail(total, args.case_variants, mutations, prefix)}.",
+                    file=sys.stderr,
+                )
+                total = wordlists.expansion_count(
+                    total, args.case_variants, mutations, prefix
+                )
             workers = (
                 args.workers
                 if args.workers is not None
                 else openssl_compat.default_workers()
             )
+            if args.wordlist_tier in resources.MEMORY_WARNING_TIERS and (
+                args.case_variants == "all" or mutations in ("common", "all")
+            ):
+                expansions = []
+                if args.case_variants == "all":
+                    expansions.append("case variants")
+                if mutations in ("common", "all"):
+                    expansions.append("mutations")
+                print(
+                    f"note: expanding the {args.wordlist_tier} tier with "
+                    f"{' and '.join(expansions)} multiplies its candidates, so "
+                    "this scan is much longer than a plain list scan.",
+                    file=sys.stderr,
+                )
             if args.wordlist_tier in resources.MEMORY_WARNING_TIERS:
                 warning = resources.memory_warning(args.wordlist_tier, workers)
                 if warning:
@@ -647,6 +730,9 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
                 progress=OpenSSLScanStatus(),
                 workers=workers,
                 priority=args.priority,
+                case_variants=args.case_variants,
+                case_variant_prefix=prefix,
+                mutations=mutations,
             )
             if not results:
                 raise SystemExit(
@@ -680,20 +766,61 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
     if method in ("fernet", "aes", "des3"):
         if not args.key:
             if args.no_wordlist:
-                words = []
-            elif args.wordlist:
-                words = load_wordlist(args.wordlist)
-            else:
-                # Modern containers use a real iterated KDF: the full
-                # dictionary would turn a scan into hours, so stay small.
-                words = load_common_wordlist()
-            if not words:
-                raise SystemExit("error: modern crypto needs --key (no wordlist loaded)")
-            results = modern_crypto.dictionary_attack(text, words, top=args.top)
+                raise SystemExit(
+                    "error: modern crypto needs --key (no wordlist loaded)"
+                )
+            try:
+                label, total, factory, prefix = _modern_wordlist_source(args)
+            except wordlists.WordlistError as exc:
+                raise SystemExit(f"error: {exc}") from exc
+            if not total:
+                raise SystemExit(
+                    "error: modern crypto needs --key (no wordlist loaded)"
+                )
+            workers = (
+                args.workers
+                if args.workers is not None
+                else openssl_compat.default_workers()
+            )
+            resources.lower_priority(args.priority)
+            mutations = _mutations_for(args, method)
+            candidates = wordlists.expansion_count(
+                total, args.case_variants, mutations, prefix
+            )
+            detail = _wordlist_detail(
+                total, args.case_variants, mutations, prefix
+            )
+            estimate = _format_duration(
+                modern_crypto.estimate_attack_seconds(text, candidates, workers)
+            )
+            print(
+                f"Scanning the {label} ({detail}) with {workers} worker(s); "
+                f"about {estimate}.",
+                file=sys.stderr,
+                flush=True,
+            )
+            if mutations == "off":
+                print(
+                    "note: every modern guess pays for a key derivation; pass "
+                    "--mutations numbers|symbols|common|all to also try digit "
+                    "and symbol tails (much longer).",
+                    file=sys.stderr,
+                )
+            results = modern_crypto.dictionary_attack_stream(
+                text,
+                factory,
+                candidates,
+                top=args.top,
+                workers=workers,
+                priority=args.priority,
+                case_variants=args.case_variants,
+                mutations=mutations,
+            )
             if not results:
                 raise SystemExit(
-                    "No passphrase in the wordlist worked. Modern crypto cannot be "
-                    "brute-forced; supply --key if you know it."
+                    f"No passphrase in the {label} ({detail}) opened this "
+                    "container. Modern crypto cannot be brute-forced; supply "
+                    "--key if you know it."
                 )
             return results
         alg = modern_crypto.container_alg(text)
@@ -718,9 +845,10 @@ def cmd_decrypt(args) -> int:
     if args.workers is not None:
         if args.workers < 1:
             raise SystemExit("error: --workers must be at least 1")
-        if method != "openssl":
+        if method not in ("openssl", "fernet", "aes", "des3"):
             raise SystemExit(
-                "error: --workers only applies to --method openssl"
+                "error: --workers only applies to --method openssl, aes, "
+                "fernet or des3"
             )
 
     if method == "openssl":
@@ -732,9 +860,10 @@ def cmd_decrypt(args) -> int:
             "error: --wordlist and --wordlist-tier are mutually exclusive"
         )
     if args.wordlist_tier:
-        if method != "openssl":
+        if method not in ("openssl", "fernet", "aes", "des3"):
             raise SystemExit(
-                "error: --wordlist-tier only applies to --method openssl"
+                "error: --wordlist-tier only applies to --method openssl, "
+                "aes, fernet or des3"
             )
         if args.key:
             raise SystemExit(
@@ -903,8 +1032,21 @@ def cmd_encrypt(args) -> int:
 
 def cmd_identify(args) -> int:
     text = read_input(args.input).strip()
-    matches = modern_crypto.identify_hash(text)
     print(f"input length: {len(text)}")
+    if modern_crypto.is_container(text):
+        alg = modern_crypto.container_alg(text)
+        print(
+            "  decryptre:v1 container: "
+            f"{present.display_name('modern', {'alg': alg})}"
+        )
+        if alg in present.AUTHENTICATED_ALGS:
+            print("  authenticated: the cipher's tag proves the passphrase")
+        print(
+            "  decrypt with: decryptre decrypt --method aes|fernet|des3 "
+            "--key PASSPHRASE"
+        )
+        return 0
+    matches = modern_crypto.identify_hash(text)
     if matches:
         for match in matches:
             print(f"  {match}")
@@ -1017,10 +1159,35 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("small", "medium", "large", "5m", "10m", "50m", "100m"),
         default=None,
         help=(
-            "wordlist size for explicit --method openssl scans: small "
-            "(10,001), medium (1.37M, default), large (medium + local "
-            "RockYou), or generated 5m/10m/50m/100m tiers. Generated tiers "
-            "try the common list first and are not shipped as data."
+            "wordlist size for explicit scans: small (10,001), medium "
+            "(1.37M, default for --method openssl), large (medium + local "
+            "RockYou), or generated 5m/10m/50m/100m tiers. AES, Fernet and "
+            "3DES scans default to small. Generated tiers try the common "
+            "list first and are not shipped as data."
+        ),
+    )
+    decrypt.add_argument(
+        "--case-variants",
+        choices=wordlists.CASE_MODES,
+        default="common",
+        help=(
+            "also try Capitalised and UPPERCASE forms of wordlist entries: "
+            "off uses each list exactly as written, common expands the small "
+            "tier and custom --wordlist files, all expands every tier (about "
+            "three times the work); default: common"
+        ),
+    )
+    decrypt.add_argument(
+        "--mutations",
+        choices=wordlists.MUTATION_MODES,
+        default=None,
+        help=(
+            "append numbers and symbols to each wordlist entry: off keeps the "
+            "list as written, numbers adds a trailing digit, symbols adds "
+            "punctuation and short digit+symbol tails, common adds 00-99, "
+            "short runs and years, all adds bounded leetspeak and doubled "
+            "symbols. Default: numbers for --method openssl, off for AES, "
+            "Fernet and 3DES (each modern guess costs a key derivation)"
         ),
     )
     decrypt.add_argument(
@@ -1033,9 +1200,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "worker processes for explicit OpenSSL wordlist/incremental "
-            "scans (default: CPUs available to this process, capped at 64; "
-            "1 disables)"
+            "worker processes for explicit OpenSSL, AES, Fernet and 3DES "
+            "wordlist scans (default: CPUs available to this process, capped "
+            "at 64; 1 disables)"
         ),
     )
     decrypt.add_argument(
@@ -1043,9 +1210,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(resources.PRIORITY_CHOICES),
         default="background",
         help=(
-            "OS scheduling priority for OpenSSL scans: background (default) "
-            "keeps foreground applications responsive at the full worker "
-            "count; normal leaves the process at the shell's priority"
+            "OS scheduling priority for OpenSSL, AES, Fernet and 3DES scans: "
+            "background (default) keeps foreground applications responsive "
+            "at the full worker count; normal leaves the process at the "
+            "shell's priority"
         ),
     )
     incremental_options = decrypt.add_argument_group(

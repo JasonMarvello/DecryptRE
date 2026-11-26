@@ -30,10 +30,12 @@ from . import (
 from .auto_detect import detect
 from .cli import (
     OpenSSLScanStatus,
+    _format_duration,
     _xor_wrapper,
     load_common_wordlist,
     read_input,
 )
+from .containers import is_container
 from .models import Candidate
 from .scorer import score_text
 
@@ -404,35 +406,51 @@ def _results_screen(results: List[Candidate]) -> None:
 TIER_ORDER = ("small", "medium", "large", "5m", "10m", "50m", "100m")
 
 
-def _choose_openssl_tier() -> Optional[str]:
-    """Ask which passphrase tier to use for an OpenSSL blob."""
+def _choose_tier(kind: str = "openssl") -> Optional[str]:
+    """Ask which passphrase tier to use for a blob or a modern container."""
+    default_tier = "medium" if kind == "openssl" else "small"
     labels: List[str] = []
     tiers: List[str] = []
     for tier in TIER_ORDER:
         try:
             count = wordlists.tier_count(tier)
-            suffix = " (default)" if tier == "medium" else ""
+            suffix = " (default)" if tier == default_tier else ""
             labels.append(f"{tier} - {count:,} candidates{suffix}")
         except wordlists.WordlistError:
             labels.append(f"{tier} - unavailable (local RockYou not installed)")
         tiers.append(tier)
 
-    choice = menu(
-        "OpenSSL blob detected. Choose a passphrase wordlist tier:",
-        labels,
-        default=1,
-    )
+    if kind == "openssl":
+        title = "OpenSSL blob detected. Choose a passphrase wordlist tier:"
+    else:
+        name = present.display_name("modern", {"alg": kind})
+        title = (
+            f"Authenticated container detected ({name}). Choose a passphrase "
+            "wordlist tier:"
+        )
+    choice = menu(title, labels, default=TIER_ORDER.index(default_tier))
     if choice is None:
         return None
     return tiers[choice]
+
+
+def _choose_openssl_tier() -> Optional[str]:
+    """Compatibility name for the OpenSSL tier prompt."""
+    return _choose_tier("openssl")
 
 
 def _scan_openssl_tier(
     text: str, tier: str, quiet: bool = False
 ) -> List[Candidate]:
     """Stream one tier against an OpenSSL blob, with the same worker defaults."""
+    prefix = None
     try:
         total = wordlists.tier_count(tier)
+        if tier != "small":
+            prefix = wordlists.tier_count("small")
+        candidates = wordlists.expansion_count(
+            total, "common", "numbers", prefix
+        )
 
         def factory():
             return wordlists.iter_tier(tier)
@@ -443,7 +461,8 @@ def _scan_openssl_tier(
 
     if not quiet:
         print(
-            f"  Scanning the {tier} tier ({total:,} passphrases)...",
+            f"  Scanning the {tier} tier ({total:,} passphrases, up to "
+            f"{candidates:,} with case variants and number tails)...",
             flush=True,
         )
     workers = openssl_compat.default_workers()
@@ -454,11 +473,63 @@ def _scan_openssl_tier(
     return openssl_compat.dictionary_attack_stream(
         text,
         factory,
-        total,
+        candidates,
         top=2,
         progress=OpenSSLScanStatus(stream=sys.stdout, prefix="  "),
         workers=workers,
         priority="background",
+        case_variants="common",
+        case_variant_prefix=prefix,
+        mutations="numbers",
+    )
+
+
+def _scan_modern_tier(
+    text: str, tier: str, quiet: bool = False
+) -> List[Candidate]:
+    """Stream one tier against an authenticated container, with an estimate."""
+    try:
+        total = wordlists.tier_count(tier)
+
+        def factory():
+            return wordlists.iter_tier(tier)
+
+    except wordlists.WordlistError as exc:
+        print(f"  Cannot load the {tier} tier: {exc}")
+        return []
+
+    alg = modern_crypto.container_alg(text) or "modern"
+    workers = openssl_compat.default_workers()
+    candidates = wordlists.expansion_count(total, "common", "off")
+    if not quiet:
+        print(
+            f"  Scanning the {tier} tier ({total:,} passphrases, up to "
+            f"{candidates:,} with case variants) against "
+            f"{present.display_name('modern', {'alg': alg})}...",
+            flush=True,
+        )
+        estimate = modern_crypto.estimate_attack_seconds(text, candidates, workers)
+        print(
+            f"  About {_format_duration(estimate)} with {workers} workers.",
+            flush=True,
+        )
+        per_guess = modern_crypto.estimate_attack_seconds(text, 1, 1)
+        print(
+            "  Each guess costs about "
+            f"{_format_duration(per_guess)}; add --mutations numbers|common in "
+            "the CLI to also try digit and symbol tails.",
+            flush=True,
+        )
+    resources.lower_priority("background")
+    return modern_crypto.dictionary_attack_stream(
+        text,
+        factory,
+        candidates,
+        top=2,
+        workers=workers,
+        priority="background",
+        case_variants="common",
+        mutations="off",
     )
 
 
@@ -466,8 +537,11 @@ def _search(
     text: str, key: str, quiet: bool = False, tier: Optional[str] = None
 ) -> List[Candidate]:
     """Decrypt ``text`` and return the best candidates."""
-    if tier and not key and openssl_compat.looks_like(text):
-        return _scan_openssl_tier(text, tier, quiet=quiet)
+    if tier and not key:
+        if openssl_compat.looks_like(text):
+            return _scan_openssl_tier(text, tier, quiet=quiet)
+        if is_container(text):
+            return _scan_modern_tier(text, tier, quiet=quiet)
 
     results: List[Candidate] = []
     if key:
@@ -519,9 +593,15 @@ def decrypt_flow() -> None:
     key = ask("Passphrase, if you know it (blank to search):")
 
     tier = None
-    if not key and openssl_compat.looks_like(text):
-        tier = _choose_openssl_tier()
-        if tier is None:
+    if not key:
+        prompted = False
+        if openssl_compat.looks_like(text):
+            tier = _choose_openssl_tier()
+            prompted = True
+        elif is_container(text):
+            tier = _choose_tier(modern_crypto.container_alg(text) or "modern")
+            prompted = True
+        if prompted and tier is None:
             return
 
     results = _search(text, key, tier=tier)

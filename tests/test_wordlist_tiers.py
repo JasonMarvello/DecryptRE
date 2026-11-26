@@ -6,7 +6,7 @@ import pytest
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
-from decryptre import openssl_compat, wordlist
+from decryptre import modern_crypto, openssl_compat, wordlist
 from decryptre.cli import main
 from decryptre.models import Candidate
 
@@ -127,6 +127,10 @@ def test_explicit_openssl_uses_requested_tier(
             "openssl",
             "--wordlist-tier",
             tier,
+            "--case-variants",
+            "off",
+            "--mutations",
+            "off",
             "--workers",
             "1",
         ]
@@ -162,6 +166,10 @@ def test_explicit_openssl_defaults_to_medium(monkeypatch):
                 _blob(),
                 "--method",
                 "openssl",
+                "--case-variants",
+                "off",
+                "--mutations",
+                "off",
                 "--workers",
                 "1",
             ]
@@ -190,3 +198,187 @@ def test_missing_large_tier_explains_local_build(monkeypatch, tmp_path):
             ]
         )
     assert "not shipped" in str(excinfo.value)
+
+
+def test_modern_container_accepts_a_wordlist_tier(monkeypatch, capsys):
+    token = modern_crypto.encrypt_aes(MESSAGE, "Love", mode="gcm")
+    seen = {}
+
+    def fake_stream(text, factory, total, **kwargs):
+        seen.update(total=total, kwargs=kwargs, words=list(factory())[:2])
+        return [
+            Candidate(
+                MESSAGE,
+                "modern",
+                {"alg": "aes-gcm", "passphrase": "Love"},
+                1.0,
+                verified=True,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "decryptre.cli.modern_crypto.dictionary_attack_stream", fake_stream
+    )
+
+    code = main(
+        [
+            "decrypt",
+            "--input",
+            token,
+            "--method",
+            "aes",
+            "--wordlist-tier",
+            "small",
+            "--workers",
+            "2",
+        ]
+    )
+
+    assert code == 0
+    assert seen["total"] == wordlist.case_variant_count(
+        wordlist.tier_count("small"), "common"
+    )
+    assert seen["words"] == [b"password", b"123456"]
+    assert seen["kwargs"]["workers"] == 2
+    assert seen["kwargs"]["case_variants"] == "common"
+    assert seen["kwargs"]["mutations"] == "off"
+    assert "--mutations numbers|symbols|common|all" in capsys.readouterr().err
+
+
+def test_modern_failure_names_the_tier_it_searched(monkeypatch):
+    token = modern_crypto.encrypt_aes(MESSAGE, "Love", mode="gcm")
+    monkeypatch.setattr(
+        "decryptre.cli.modern_crypto.dictionary_attack_stream",
+        lambda *args, **kwargs: [],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            ["decrypt", "--input", token, "--method", "aes", "--workers", "1"]
+        )
+
+    message = str(excinfo.value)
+    assert "small tier" in message
+    assert "10,001 base candidates" in message
+
+
+def test_case_variants_all_warns_on_generated_tiers(monkeypatch, capsys):
+    def fake_stream(token, factory, total, **kwargs):
+        return [
+            Candidate(
+                MESSAGE,
+                "openssl",
+                {"alg": "test", "passphrase": "alpha"},
+                1.0,
+                verified=True,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "decryptre.cli.openssl_compat.dictionary_attack_stream", fake_stream
+    )
+
+    assert (
+        main(
+            [
+                "decrypt",
+                "--input",
+                _blob(),
+                "--method",
+                "openssl",
+                "--wordlist-tier",
+                "50m",
+                "--case-variants",
+                "all",
+                "--workers",
+                "1",
+            ]
+        )
+        == 0
+    )
+    assert "much longer than a plain list scan" in capsys.readouterr().err
+
+
+def _write_words(tmp_path, *words):
+    path = tmp_path / "words.txt"
+    path.write_text("\n".join(words) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def test_openssl_tries_number_tails_by_default(tmp_path):
+    code = main(
+        [
+            "decrypt",
+            "--input",
+            _blob("alpha1"),
+            "--method",
+            "openssl",
+            "--wordlist",
+            _write_words(tmp_path, "alpha"),
+            "--workers",
+            "1",
+        ]
+    )
+
+    assert code == 0
+
+
+def test_mutations_off_keeps_the_list_as_written(tmp_path):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "decrypt",
+                "--input",
+                _blob("alpha1"),
+                "--method",
+                "openssl",
+                "--wordlist",
+                _write_words(tmp_path, "alpha"),
+                "--mutations",
+                "off",
+                "--workers",
+                "1",
+            ]
+        )
+
+    assert "No passphrase" in str(excinfo.value)
+
+
+def test_symbol_tails_are_opt_in(tmp_path):
+    words = _write_words(tmp_path, "love")
+    blob = _blob("Love!")
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "decrypt",
+                "--input",
+                blob,
+                "--method",
+                "openssl",
+                "--wordlist",
+                words,
+                "--workers",
+                "1",
+            ]
+        )
+    assert "No passphrase" in str(excinfo.value)
+
+    assert (
+        main(
+            [
+                "decrypt",
+                "--input",
+                blob,
+                "--method",
+                "openssl",
+                "--wordlist",
+                words,
+                "--mutations",
+                "symbols",
+                "--workers",
+                "1",
+            ]
+        )
+        == 0
+    )

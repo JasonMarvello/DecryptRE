@@ -55,7 +55,8 @@ def test_tier_scan_streams_the_selected_tier(monkeypatch):
     seen = {}
 
     monkeypatch.setattr(interactive.openssl_compat, "looks_like", lambda text: True)
-    monkeypatch.setattr(interactive.wordlists, "tier_count", lambda tier: 5_000_000)
+    counts = {"small": 10_001, "5m": 5_000_000}
+    monkeypatch.setattr(interactive.wordlists, "tier_count", lambda tier: counts[tier])
     monkeypatch.setattr(
         interactive.wordlists, "iter_tier", lambda tier: iter([b"alpha", b"beta"])
     )
@@ -79,10 +80,13 @@ def test_tier_scan_streams_the_selected_tier(monkeypatch):
     results = interactive._search("U2FsdGVkX1...", "", tier="5m")
 
     assert seen["text"] == "U2FsdGVkX1..."
-    assert seen["total"] == 5_000_000
+    assert seen["total"] == 5_320_032
     assert seen["words"] == [b"alpha", b"beta"]
     assert seen["kwargs"]["top"] == 2
     assert seen["kwargs"]["workers"] == 7
+    assert seen["kwargs"]["case_variants"] == "common"
+    assert seen["kwargs"]["case_variant_prefix"] == 10_001
+    assert seen["kwargs"]["mutations"] == "numbers"
     assert results[0].text == "readable plaintext"
 
 
@@ -152,3 +156,75 @@ def test_decrypt_flow_skips_the_tier_prompt_when_key_is_known(monkeypatch):
     interactive.decrypt_flow()
 
     assert seen == {"key": "secret", "tier": None}
+
+
+def test_tier_menu_names_an_authenticated_container(monkeypatch):
+    seen = {}
+
+    def fake_menu(title, options, default=0):
+        seen.update(title=title, default=default, options=list(options))
+        return 0
+
+    monkeypatch.setattr(interactive, "menu", fake_menu)
+
+    assert interactive._choose_tier("aes-gcm") == "small"
+    assert "AES-256-GCM" in seen["title"]
+    assert "Authenticated container detected" in seen["title"]
+    assert seen["default"] == 0
+    assert seen["options"][0].endswith("(default)")
+
+
+def test_decrypt_flow_offers_a_tier_for_a_container(monkeypatch):
+    answers = iter(["decryptre:v1:...", ""])
+    seen = {}
+    monkeypatch.setattr(interactive, "ask", lambda prompt: next(answers))
+    monkeypatch.setattr(interactive, "read_input", lambda value: value)
+    monkeypatch.setattr(interactive.openssl_compat, "looks_like", lambda text: False)
+    monkeypatch.setattr(interactive, "is_container", lambda text: True)
+    monkeypatch.setattr(interactive.modern_crypto, "container_alg", lambda text: "aes-gcm")
+    monkeypatch.setattr(interactive, "_choose_tier", lambda kind: "small")
+    monkeypatch.setattr(interactive, "pause", lambda: None)
+
+    def fake_search(text, key, quiet=False, tier=None):
+        seen.update(key=key, tier=tier)
+        return []
+
+    monkeypatch.setattr(interactive, "_search", fake_search)
+
+    interactive.decrypt_flow()
+
+    assert seen == {"key": "", "tier": "small"}
+
+
+def test_modern_tier_scan_reports_an_estimate_and_streams(monkeypatch, capsys):
+    seen = {}
+    monkeypatch.setattr(interactive.wordlists, "tier_count", lambda tier: 10_001)
+    monkeypatch.setattr(
+        interactive.wordlists, "iter_tier", lambda tier: iter([b"love"])
+    )
+    monkeypatch.setattr(interactive.openssl_compat, "default_workers", lambda: 2)
+    monkeypatch.setattr(
+        interactive.modern_crypto, "container_alg", lambda text: "aes-gcm"
+    )
+    monkeypatch.setattr(
+        interactive.modern_crypto,
+        "estimate_attack_seconds",
+        lambda text, total, workers: 8.0,
+    )
+
+    def fake_stream(text, factory, total, **kwargs):
+        seen.update(total=total, kwargs=kwargs)
+        return []
+
+    monkeypatch.setattr(
+        interactive.modern_crypto, "dictionary_attack_stream", fake_stream
+    )
+
+    assert interactive._scan_modern_tier("token", "small") == []
+    out = capsys.readouterr().out
+    assert "About 8s with 2 workers" in out
+    assert "--mutations numbers|common" in out
+    assert seen["total"] == 30_003
+    assert seen["kwargs"]["workers"] == 2
+    assert seen["kwargs"]["case_variants"] == "common"
+    assert seen["kwargs"]["mutations"] == "off"

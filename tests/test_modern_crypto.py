@@ -41,9 +41,16 @@ def test_wrong_passphrase_returns_none():
     for token in (
         modern_crypto.encrypt_fernet(MESSAGE, PASSPHRASE),
         modern_crypto.encrypt_aes(MESSAGE, PASSPHRASE, mode="gcm"),
-        modern_crypto.encrypt_aes(MESSAGE, PASSPHRASE, mode="cbc"),
     ):
         assert modern_crypto.try_decrypt(token, "wrong") is None
+
+
+def test_wrong_passphrase_never_returns_the_message_in_cbc():
+    # CBC has no authentication tag, so a wrong key passes padding about once
+    # in 256 tries. It must never produce the original plaintext, and the
+    # dictionary attack must not report it as verified for a random key.
+    token = modern_crypto.encrypt_aes(MESSAGE, PASSPHRASE, mode="cbc")
+    assert modern_crypto.try_decrypt(token, "wrong") != MESSAGE
 
 
 def test_tampered_ciphertext_is_rejected():
@@ -96,9 +103,10 @@ def test_des3_roundtrip(kdf):
     assert modern_crypto.decrypt_des3(token, PASSPHRASE) == MESSAGE
 
 
-def test_des3_wrong_passphrase_returns_none():
+def test_des3_wrong_passphrase_never_returns_the_message():
+    # 3DES-CBC is unauthenticated; a wrong key can pass the padding check.
     token = modern_crypto.encrypt_des3(MESSAGE, PASSPHRASE)
-    assert modern_crypto.try_decrypt(token, "wrong") is None
+    assert modern_crypto.try_decrypt(token, "wrong") != MESSAGE
 
 
 def test_des3_dictionary_attack():
@@ -120,3 +128,87 @@ def test_try_decrypt_any_reports_algorithm():
     plain, alg = modern_crypto.try_decrypt_any(token, PASSPHRASE)
     assert plain == MESSAGE
     assert alg == "des3-cbc"
+
+
+def test_aes_gcm_dictionary_attack_finds_capitalised_passphrase():
+    token = modern_crypto.encrypt_aes(MESSAGE, "Love", mode="gcm")
+
+    results = modern_crypto.dictionary_attack(token, ["love", "Love"], top=2)
+
+    assert results
+    assert results[0].params["passphrase"] == "Love"
+    assert results[0].params["alg"] == "aes-gcm"
+    assert results[0].verified is True
+
+
+def test_case_variants_expand_a_lowercase_only_list():
+    token = modern_crypto.encrypt_aes(MESSAGE, "Love", mode="gcm")
+
+    expanded = modern_crypto.dictionary_attack(
+        token, ["love"], case_variants="common"
+    )
+
+    assert expanded
+    assert expanded[0].params["passphrase"] == "Love"
+    assert modern_crypto.dictionary_attack(token, ["love"], case_variants="off") == []
+
+
+def test_streamed_attack_calls_the_factory_once_and_reports_progress():
+    token = modern_crypto.encrypt_aes(MESSAGE, "Love", mode="gcm")
+    calls = []
+    progress = []
+
+    def factory():
+        calls.append(1)
+        return iter([b"wrong", b"Love"])
+
+    results = modern_crypto.dictionary_attack_stream(
+        token,
+        factory,
+        2,
+        top=1,
+        progress=lambda done, total, label: progress.append((done, total, label)),
+    )
+
+    assert results[0].params["passphrase"] == "Love"
+    assert len(calls) == 1
+    assert progress[-1][:2] == (2, 2)
+
+
+def test_parallel_modern_scan_matches_the_serial_result(monkeypatch):
+    token = modern_crypto.encrypt_aes(MESSAGE, "Love", mode="gcm")
+    words = ["wrong", "nope", "Love"]
+
+    serial = modern_crypto.dictionary_attack(token, words, workers=1)
+    monkeypatch.setattr(modern_crypto, "PARALLEL_MIN_PASSPHRASES", 1)
+    parallel = modern_crypto.dictionary_attack(token, words, workers=2)
+
+    assert [item.params["passphrase"] for item in parallel] == [
+        item.params["passphrase"] for item in serial
+    ]
+
+
+def test_mutations_find_a_numbered_and_symbol_passphrase():
+    token = modern_crypto.encrypt_aes(MESSAGE, "Love123!", mode="gcm")
+
+    found = modern_crypto.dictionary_attack(token, ["Love"], mutations="common")
+
+    assert found
+    assert found[0].params["passphrase"] == "Love123!"
+    assert modern_crypto.dictionary_attack(token, ["Love"], mutations="off") == []
+
+
+def test_parallel_mutation_scan_matches_the_serial_result(monkeypatch):
+    token = modern_crypto.encrypt_aes(MESSAGE, "Love!", mode="gcm")
+
+    serial = modern_crypto.dictionary_attack(token, ["Love"], mutations="symbols")
+
+    monkeypatch.setattr(modern_crypto, "PARALLEL_MIN_PASSPHRASES", 1)
+    parallel = modern_crypto.dictionary_attack(
+        token, ["Love"], mutations="symbols", workers=2
+    )
+
+    assert serial
+    assert [item.params["passphrase"] for item in parallel] == [
+        item.params["passphrase"] for item in serial
+    ]

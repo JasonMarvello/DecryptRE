@@ -11,8 +11,12 @@ Hashes (MD5/SHA-*) are one-way and are only *identified*, never "decrypted".
 
 import base64
 import hashlib
+import multiprocessing
 import os
-from typing import Iterable, List, Optional
+import time
+from collections import deque
+from concurrent import futures
+from typing import Callable, Iterable, Iterator, List, Optional, Tuple, Union
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
@@ -22,7 +26,9 @@ from Crypto.Util.Padding import pad, unpad
 
 from .containers import ContainerError, is_container, pack, unpack
 from .models import Candidate
+from .resources import lower_priority
 from .scorer import score_text
+from .wordlist import expansion_count, iter_expansions
 
 DEFAULT_ITERATIONS = 200_000
 SALT_SIZE = 16
@@ -293,42 +299,292 @@ def try_decrypt(token_text: str, passphrase: str) -> Optional[str]:
 # Dictionary attack (the honest "no passphrase" mode for modern crypto)
 # ---------------------------------------------------------------------------
 
-def dictionary_attack(
+PARALLEL_MIN_PASSPHRASES = 200
+PARALLEL_CHUNK_SIZE = 64
+RESULT_TARGET = 2
+
+
+def _as_text(word: Union[str, bytes]) -> str:
+    """Wordlist entries are bytes; decode only where a str is required."""
+    if isinstance(word, bytes):
+        return word.decode("utf-8", "replace")
+    return str(word)
+
+
+def _iter_chunks(
+    candidates: Iterable[Union[str, bytes]], size: int = PARALLEL_CHUNK_SIZE
+) -> Iterator[Tuple[str, ...]]:
+    """Group a stream into bounded, stripped, non-empty chunks."""
+    chunk: List[str] = []
+    for word in candidates:
+        passphrase = _as_text(word).strip()
+        if not passphrase:
+            continue
+        chunk.append(passphrase)
+        if len(chunk) >= size:
+            yield tuple(chunk)
+            chunk = []
+    if chunk:
+        yield tuple(chunk)
+
+
+def _rank_candidates(found: List[Candidate], top: int) -> List[Candidate]:
+    """Order by plaintext plausibility, keeping one entry per passphrase."""
+    ranked = sorted(found, key=lambda candidate: candidate.score, reverse=True)
+    unique: List[Candidate] = []
+    seen = set()
+    for candidate in ranked:
+        passphrase = candidate.params.get("passphrase")
+        if passphrase in seen:
+            continue
+        seen.add(passphrase)
+        unique.append(candidate)
+    return unique[:top]
+
+
+def _candidate(passphrase: str, plain: str, alg: str) -> Candidate:
+    return Candidate(
+        plain,
+        "modern",
+        {"alg": alg, "passphrase": passphrase},
+        score_text(plain),
+        verified=True,
+    )
+
+
+def _result_target(top: int) -> int:
+    """One authenticated hit proves the passphrase; two is already plenty."""
+    return max(1, min(top, RESULT_TARGET))
+
+
+def _dictionary_attack_serial(
     token_text: str,
-    wordlist: Iterable[str],
-    top: int = 5,
+    wordlist_factory: Callable[[], Iterable[Union[str, bytes]]],
+    total: int,
+    top: int,
+    progress: Optional[Callable[[int, int, str], None]],
 ) -> List[Candidate]:
-    """Try every passphrase in ``wordlist`` against a DecryptRE container."""
+    """Stream a wordlist in this process; a verified hit ends the scan."""
+    alg = container_alg(token_text) or "modern"
+    target = _result_target(top)
+    found: List[Candidate] = []
+    for index, raw in enumerate(wordlist_factory(), start=1):
+        passphrase = _as_text(raw).strip()
+        if not passphrase:
+            continue
+        plain = try_decrypt(token_text, passphrase)
+        if progress and (index % 500 == 0 or index >= total):
+            progress(min(index, total), total, alg)
+        if plain is not None:
+            found.append(_candidate(passphrase, plain, alg))
+            if len(found) >= target:
+                break
+    return _rank_candidates(found, top)
+
+
+_WORKER_TOKEN: Optional[str] = None
+_WORKER_ALG: Optional[str] = None
+_WORKER_STOP = None
+
+
+def _worker_init(token_text: str, stop, priority: str = "background") -> None:
+    """Unpack the container once per worker and drop to background priority."""
+    global _WORKER_TOKEN, _WORKER_ALG, _WORKER_STOP
+    lower_priority(priority)
+    _WORKER_TOKEN = token_text
+    _WORKER_ALG = container_alg(token_text)
+    _WORKER_STOP = stop
+
+
+def _stopped(chunk_index: int, offset: int) -> bool:
+    """Check the shared ordered-stop marker, throttled to every 16 guesses."""
+    if offset & 15:
+        return False
+    return _WORKER_STOP.value >= 0 and chunk_index > _WORKER_STOP.value
+
+
+def _mark_hit(chunk_index: int) -> None:
+    """Record the earliest chunk that found a passphrase."""
+    with _WORKER_STOP.get_lock():
+        marker = _WORKER_STOP.value
+        if marker < 0 or chunk_index < marker:
+            _WORKER_STOP.value = chunk_index
+
+
+def _chunk_worker(payload):
+    """Try one chunk in a spawned worker and return its verified hits."""
+    chunk_index, passwords = payload
+    token_text = _WORKER_TOKEN
+    alg = _WORKER_ALG or "modern"
+    hits = []
+    for offset, passphrase in enumerate(passwords):
+        if _stopped(chunk_index, offset):
+            break
+        plain = try_decrypt(token_text, passphrase)
+        if plain is None:
+            continue
+        _mark_hit(chunk_index)
+        hits.append(_candidate(passphrase, plain, alg))
+    return chunk_index, len(passwords), hits
+
+
+def _dictionary_attack_parallel(
+    token_text: str,
+    wordlist_factory: Callable[[], Iterable[Union[str, bytes]]],
+    total: int,
+    top: int,
+    progress: Optional[Callable[[int, int, str], None]],
+    workers: int,
+    priority: str = "background",
+) -> List[Candidate]:
+    """Scan a chunked stream in spawned workers; a hit stops later chunks."""
+    alg = container_alg(token_text) or "modern"
+    context = multiprocessing.get_context("spawn")
+    stop = context.Value("i", -1)
+    executor = futures.ProcessPoolExecutor(
+        max_workers=max(1, workers),
+        mp_context=context,
+        initializer=_worker_init,
+        initargs=(token_text, stop, priority),
+    )
+    found: List[Candidate] = []
+    pending = deque()
+    stream = _iter_chunks(wordlist_factory())
+    next_index = 0
+    done = 0
+
+    def submit_one() -> bool:
+        nonlocal next_index
+        chunk = next(stream, None)
+        if chunk is None:
+            return False
+        job = executor.submit(_chunk_worker, (next_index, chunk))
+        pending.append((next_index, job))
+        next_index += 1
+        return True
+
+    try:
+        for _ in range(max(1, workers * 2)):
+            if not submit_one():
+                break
+        while pending:
+            index, job = pending.popleft()
+            _chunk_index, processed, hits = job.result()
+            done += processed
+            if progress:
+                progress(min(done, total), total, alg)
+            marker = stop.value
+            if marker < 0 or index <= marker:
+                found.extend(hits)
+            if found:
+                break
+            submit_one()
+    finally:
+        for _index, job in pending:
+            job.cancel()
+        executor.shutdown(wait=True)
+    return _rank_candidates(found, top)
+
+
+def estimate_attack_seconds(
+    token_text: str, candidates: int, workers: int = 1
+) -> float:
+    """Time one real guess against this container, then scale it out.
+
+    Modern containers pay a fixed KDF cost per guess, so a single probe is a
+    faithful estimate; nothing here assumes a hard-coded speed.
+    """
+    # The first call also imports the cipher backends, so warm up once and time
+    # the second one; otherwise the estimate is inflated by import cost.
+    try_decrypt(token_text, "decryptre-timing-probe")
+    started = time.monotonic()
+    try_decrypt(token_text, "decryptre-timing-probe")
+    per_guess = max(0.0005, time.monotonic() - started)
+    return per_guess * max(0, candidates) / max(1, workers)
+
+
+def dictionary_attack_stream(
+    token_text: str,
+    wordlist_factory: Callable[[], Iterable[Union[str, bytes]]],
+    total: int,
+    top: int = 5,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+    workers: int = 1,
+    priority: str = "background",
+    case_variants: str = "off",
+    mutations: str = "off",
+) -> List[Candidate]:
+    """Try a streamed wordlist against a DecryptRE container.
+
+    ``wordlist_factory`` returns a fresh iterator so a tiered list is streamed
+    instead of loaded into memory. One authenticating passphrase is proof, so
+    the scan stops as soon as it finds one (or ``top`` when that is larger).
+    """
     if not is_container(token_text):
         return []
     try:
         alg = unpack(token_text).get("alg")
     except ContainerError:
         return []
-    if alg not in KNOWN_ALGS:
+    if alg not in KNOWN_ALGS or total <= 0:
         return []
+    if case_variants != "off" or mutations != "off":
+        base_factory = wordlist_factory
+        wordlist_factory = lambda: iter_expansions(  # noqa: E731
+            base_factory(), case_variants, mutations
+        )
+    workers = max(1, workers)
+    if workers > 1 and total >= PARALLEL_MIN_PASSPHRASES:
+        return _dictionary_attack_parallel(
+            token_text,
+            wordlist_factory,
+            total,
+            top,
+            progress,
+            workers,
+            priority,
+        )
+    return _dictionary_attack_serial(
+        token_text, wordlist_factory, total, top, progress
+    )
 
-    found: List[Candidate] = []
+
+def dictionary_attack(
+    token_text: str,
+    wordlist: Iterable[Union[str, bytes]],
+    top: int = 5,
+    workers: int = 1,
+    priority: str = "background",
+    case_variants: str = "off",
+    mutations: str = "off",
+    progress: Optional[Callable[[int, int, str], None]] = None,
+) -> List[Candidate]:
+    """Try every passphrase in an in-memory ``wordlist`` against a container."""
     seen = set()
-    for passphrase in wordlist:
-        passphrase = passphrase.strip()
+    words: List[str] = []
+    for word in wordlist:
+        passphrase = _as_text(word).strip()
         if not passphrase or passphrase in seen:
             continue
         seen.add(passphrase)
-        plain = try_decrypt(token_text, passphrase)
-        if plain is None:
-            continue
-        found.append(
-            Candidate(
-                plain,
-                "modern",
-                {"alg": alg, "passphrase": passphrase},
-                score_text(plain),
-                verified=True,
-            )
-        )
-    found.sort(key=lambda c: c.score, reverse=True)
-    return found[:top]
+        words.append(passphrase)
+    if not words:
+        return []
+    # iter_expansions works on the bytes a wordlist yields; encode the cleaned
+    # passphrases back so ASCII mutation tails can be appended.
+    frozen = tuple(passphrase.encode("utf-8") for passphrase in words)
+    total = expansion_count(len(frozen), case_variants, mutations)
+    return dictionary_attack_stream(
+        token_text,
+        lambda: iter(frozen),
+        total,
+        top=top,
+        progress=progress,
+        workers=workers,
+        priority=priority,
+        case_variants=case_variants,
+        mutations=mutations,
+    )
 
 
 # ---------------------------------------------------------------------------

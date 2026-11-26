@@ -12,7 +12,7 @@ import gzip
 import json
 import zlib
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 WORDLIST_DIR = Path(__file__).parent / "wordlists"
 MANIFEST_PATH = WORDLIST_DIR / "manifest.json"
@@ -26,6 +26,7 @@ GENERATED_TIERS = {
 }
 GENERATED_SUFFIX_LIMIT = 1_000_000
 TIERS = ("small", "medium", "large") + tuple(GENERATED_TIERS)
+CASE_MODES = ("off", "common", "all")
 LARGE_NOT_INSTALLED = (
     "the large tier is not installed. From a source checkout, run "
     "`python tools/build_wordlists.py --fetch-rockyou` to download "
@@ -215,25 +216,264 @@ def _seed_forms(seed: bytes) -> List[bytes]:
     return forms
 
 
-def _iter_seed_variants(seeds: List[bytes], limit: int) -> Iterator[bytes]:
-    """Yield exactly ``limit`` unique seed + six-digit-suffix candidates.
+def case_forms(candidate: bytes) -> List[bytes]:
+    """Return the original, Capitalised and UPPERCASE forms of a candidate.
 
-    The suffix is fixed-width, so two different seeds cannot collide even when
-    one seed is a prefix of another. Seed ownership is de-duplicated by the
-    caller, which keeps the whole generated tier unique.
+    Non-ASCII candidates are returned unchanged: changing their case would not
+    reliably reproduce the bytes the user typed.
+    """
+    if not candidate.isascii():
+        return [candidate]
+    capitalised = candidate[:1].upper() + candidate[1:]
+    forms = [candidate]
+    for form in (capitalised, candidate.upper()):
+        if form not in forms:
+            forms.append(form)
+    return forms
+
+
+def iter_case_variants(
+    candidates: Iterator[bytes], mode: str = "off", prefix: Optional[int] = None
+) -> Iterator[bytes]:
+    """Yield ``candidates`` with their case forms added.
+
+    ``off`` is a pure pass-through. ``common`` expands the first ``prefix``
+    candidates (the small tier) and every candidate when no prefix is given
+    (a custom list). ``all`` expands every candidate. Forms are deduplicated
+    per candidate only; a streamed list is never held in memory just to
+    deduplicate across lines.
+    """
+    if mode not in CASE_MODES:
+        raise WordlistError(f"unknown case variant mode: {mode}")
+    if mode == "off":
+        yield from candidates
+        return
+    limit = None if mode == "all" or prefix is None else max(0, prefix)
+    for index, candidate in enumerate(candidates):
+        if limit is not None and index >= limit:
+            yield candidate
+            continue
+        yield from case_forms(candidate)
+
+
+def case_variant_count(
+    total: int, mode: str = "off", prefix: Optional[int] = None
+) -> int:
+    """Largest number of candidates a scan tries with ``mode`` applied."""
+    if mode == "off":
+        return total
+    expanded = (
+        total if mode == "all" or prefix is None else min(total, max(0, prefix))
+    )
+    return total + 2 * expanded
+
+
+MUTATION_MODES = ("off", "numbers", "symbols", "common", "all")
+
+_DIGIT_TAILS = tuple(str(digit).encode("ascii") for digit in range(10))
+_SYMBOL_TAILS = (
+    b"!",
+    b"@",
+    b"#",
+    b"$",
+    b"%",
+    b"&",
+    b"*",
+    b".",
+    b"_",
+    b"-",
+    b"?",
+    b"+",
+)
+_SYMBOL_NUMBER_TAILS = (b"1!", b"12!", b"123!", b"1.", b"123.")
+_COMMON_NUMBER_TAILS = (
+    tuple(f"{number:02d}".encode("ascii") for number in range(100))
+    + (b"123", b"1234", b"12345", b"007", b"69")
+    + tuple(str(year).encode("ascii") for year in range(1970, 2027))
+)
+_DOUBLED_SYMBOL_TAILS = (b"!!", b"123!!")
+_LEET_SUBSTITUTIONS = {
+    ord("a"): (ord("4"), ord("@")),
+    ord("b"): (ord("8"),),
+    ord("e"): (ord("3"),),
+    ord("g"): (ord("9"),),
+    ord("i"): (ord("1"),),
+    ord("o"): (ord("0"),),
+    ord("s"): (ord("5"), ord("$")),
+    ord("t"): (ord("7"),),
+}
+_LEET_POSITION_LIMIT = 6
+_LEET_MAX_FORMS = 72
+
+
+def _tail_groups(mode: str) -> Tuple[Tuple[bytes, ...], ...]:
+    """The suffix sets a mutation mode appends to every candidate."""
+    if mode == "numbers":
+        return (_DIGIT_TAILS,)
+    if mode == "symbols":
+        return (_SYMBOL_TAILS, _SYMBOL_NUMBER_TAILS)
+    groups: Tuple[Tuple[bytes, ...], ...] = (
+        _DIGIT_TAILS,
+        _COMMON_NUMBER_TAILS,
+        _SYMBOL_TAILS,
+        _SYMBOL_NUMBER_TAILS,
+    )
+    if mode == "all":
+        return groups + (_DOUBLED_SYMBOL_TAILS,)
+    return groups
+
+
+def mutation_factor(mode: str = "off") -> int:
+    """Upper bound on the extra candidates ``mode`` adds per input form."""
+    if mode not in MUTATION_MODES:
+        raise WordlistError(f"unknown mutation mode: {mode}")
+    if mode == "off":
+        return 0
+    tails = set()
+    for group in _tail_groups(mode):
+        tails.update(group)
+    factor = len(tails)
+    if mode == "all":
+        factor += _LEET_MAX_FORMS
+    return factor
+
+
+def _leet_forms(candidate: bytes) -> List[bytes]:
+    """One- and two-substitution leetspeak forms, bounded by position count."""
+    positions = [
+        index
+        for index, byte in enumerate(candidate)
+        if byte in _LEET_SUBSTITUTIONS
+    ][:_LEET_POSITION_LIMIT]
+    if not positions:
+        return []
+    forms = []
+    for index in positions:
+        for replacement in _LEET_SUBSTITUTIONS[candidate[index]]:
+            forms.append(candidate[:index] + bytes([replacement]) + candidate[index + 1:])
+    for first_index, first in enumerate(positions):
+        for second in positions[first_index + 1:]:
+            for first_replacement in _LEET_SUBSTITUTIONS[candidate[first]]:
+                for second_replacement in _LEET_SUBSTITUTIONS[candidate[second]]:
+                    mutated = bytearray(candidate)
+                    mutated[first] = first_replacement
+                    mutated[second] = second_replacement
+                    forms.append(bytes(mutated))
+    return forms
+
+
+def mutation_forms(candidate: bytes, mode: str = "off") -> List[bytes]:
+    """Return ``candidate`` plus the number/symbol forms ``mode`` allows.
+
+    The bare candidate always comes first. Non-ASCII candidates are returned
+    unchanged: appending an ASCII tail to them is still safe, but leetspeak and
+    symbols are skipped because the tails are calibrated for ASCII passwords.
+    """
+    if mode not in MUTATION_MODES:
+        raise WordlistError(f"unknown mutation mode: {mode}")
+    if mode == "off":
+        return [candidate]
+    if not candidate.isascii():
+        return [candidate]
+    forms = [candidate]
+    seen = {candidate}
+    if mode == "all":
+        for form in _leet_forms(candidate):
+            if form not in seen:
+                seen.add(form)
+                forms.append(form)
+    for group in _tail_groups(mode):
+        for tail in group:
+            form = candidate + tail
+            if form not in seen:
+                seen.add(form)
+                forms.append(form)
+    return forms
+
+
+def iter_expansions(
+    candidates: Iterator[bytes],
+    case_mode: str = "off",
+    mutation_mode: str = "off",
+    prefix: Optional[int] = None,
+) -> Iterator[bytes]:
+    """Apply case variants and mutations to the same base candidate.
+
+    Both layers expand only the first ``prefix`` candidates (the small tier)
+    unless their mode is ``all``, so a medium-tier scan does not compound two
+    different prefix rules.
+    """
+    if case_mode not in CASE_MODES:
+        raise WordlistError(f"unknown case variant mode: {case_mode}")
+    if mutation_mode not in MUTATION_MODES:
+        raise WordlistError(f"unknown mutation mode: {mutation_mode}")
+    if case_mode == "off" and mutation_mode == "off":
+        yield from candidates
+        return
+    for index, candidate in enumerate(candidates):
+        in_prefix = prefix is None or index < prefix
+        if case_mode == "off":
+            forms: Tuple[bytes, ...] = (candidate,)
+        elif case_mode == "all" or in_prefix:
+            forms = tuple(case_forms(candidate))
+        else:
+            forms = (candidate,)
+        for form in forms:
+            if mutation_mode == "off":
+                yield form
+            elif mutation_mode == "all" or in_prefix:
+                yield from mutation_forms(form, mutation_mode)
+            else:
+                yield form
+
+
+def expansion_count(
+    total: int,
+    case_mode: str = "off",
+    mutation_mode: str = "off",
+    prefix: Optional[int] = None,
+) -> int:
+    """Upper bound on the candidates :func:`iter_expansions` can emit."""
+    if case_mode not in CASE_MODES:
+        raise WordlistError(f"unknown case variant mode: {case_mode}")
+    if mutation_mode not in MUTATION_MODES:
+        raise WordlistError(f"unknown mutation mode: {mutation_mode}")
+    expanded = total if prefix is None else min(total, max(0, prefix))
+    case_base = total if (case_mode == "all" or prefix is None) else expanded
+    case_forms_total = total + (2 * case_base if case_mode != "off" else 0)
+    if mutation_mode == "off":
+        return case_forms_total
+    mutated_base = total if (mutation_mode == "all" or prefix is None) else expanded
+    mutated_forms = mutated_base * (3 if case_mode != "off" else 1)
+    return case_forms_total + mutation_factor(mutation_mode) * mutated_forms
+
+
+def _iter_seed_variants(seeds: List[bytes], limit: int) -> Iterator[bytes]:
+    """Yield exactly ``limit`` unique bare-seed and suffixed candidates.
+
+    Each case form of a seed is tried bare first (so ``patty``, ``Patty`` and
+    ``PATTY`` are candidates, not only their numbered forms), then with the
+    six-digit suffixes. The suffix is fixed-width, so two different seeds
+    cannot collide even when one seed is a prefix of another. Seed ownership is
+    de-duplicated by the caller, which keeps the whole generated tier unique.
     """
     if limit <= 0:
         return
     forms = [form for seed in seeds for form in _seed_forms(seed)]
     if not forms:
         raise WordlistError("generated tier has no seed names")
-    capacity = len(forms) * GENERATED_SUFFIX_LIMIT
+    capacity = len(forms) * (1 + GENERATED_SUFFIX_LIMIT)
     if limit > capacity:
         raise WordlistError(
             f"generated tier needs {limit:,} candidates but its seeds only "
             f"support {capacity:,}"
         )
     emitted = 0
+    for form in forms:
+        yield form
+        emitted += 1
+        if emitted >= limit:
+            return
     for suffix in range(GENERATED_SUFFIX_LIMIT):
         code = f"{suffix:06d}".encode("ascii")
         for form in forms:

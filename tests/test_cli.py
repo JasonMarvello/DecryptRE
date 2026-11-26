@@ -1,5 +1,6 @@
 import pytest
 
+from decryptre import modern_crypto
 from decryptre.cli import main
 
 MESSAGE = "Meet me at the old lighthouse at midnight."
@@ -62,6 +63,15 @@ def test_identify_reports_hash_and_one_way_note(capsys):
     )
     assert "md5" in out
     assert "one-way" in out
+
+
+def test_identify_reports_an_authenticated_container(capsys):
+    token = modern_crypto.encrypt_aes(MESSAGE, "Love", mode="gcm")
+
+    out = run(capsys, ["identify", "--input", token])
+
+    assert "AES-256-GCM" in out
+    assert "tag proves the passphrase" in out
 
 
 def test_missing_key_for_vigenere_encrypt_exits():
@@ -146,3 +156,17 @@ def test_encrypt_help_documents_output(capsys):
     with pytest.raises(SystemExit):
         main(["encrypt", "--help"])
     assert "--output" in capsys.readouterr().out
+
+
+def test_mutations_default_depends_on_the_method():
+    from decryptre.cli import _mutations_for, build_parser
+
+    parser = build_parser()
+    openssl = parser.parse_args(["decrypt", "--input", "x", "--method", "openssl"])
+    assert _mutations_for(openssl, "openssl") == "numbers"
+    assert _mutations_for(openssl, "aes") == "off"
+
+    explicit = parser.parse_args(
+        ["decrypt", "--input", "x", "--method", "aes", "--mutations", "symbols"]
+    )
+    assert _mutations_for(explicit, "aes") == "symbols"
