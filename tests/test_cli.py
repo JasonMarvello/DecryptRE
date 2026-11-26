@@ -170,3 +170,43 @@ def test_mutations_default_depends_on_the_method():
         ["decrypt", "--input", "x", "--method", "aes", "--mutations", "symbols"]
     )
     assert _mutations_for(explicit, "aes") == "symbols"
+
+
+def test_modern_scan_forwards_the_case_variant_prefix(monkeypatch):
+    from decryptre import cli
+
+    counts = {"small": 10_001, "medium": 1_368_353}
+    seen = {}
+    monkeypatch.setattr(cli.wordlists, "tier_count", lambda tier: counts[tier])
+    monkeypatch.setattr(cli.wordlists, "iter_tier", lambda tier: iter([b"love"]))
+    monkeypatch.setattr(
+        cli.modern_crypto, "estimate_attack_seconds", lambda *args: 1.0
+    )
+    monkeypatch.setattr(cli.resources, "lower_priority", lambda priority: None)
+
+    def fake_stream(text, factory, total, **kwargs):
+        seen.update(total=total, kwargs=kwargs)
+        return []
+
+    monkeypatch.setattr(cli.modern_crypto, "dictionary_attack_stream", fake_stream)
+    args = cli.build_parser().parse_args([
+        "decrypt",
+        "--input",
+        "decryptre:v1:AAAA",
+        "--method",
+        "aes",
+        "--wordlist-tier",
+        "medium",
+        "--workers",
+        "1",
+    ])
+
+    with pytest.raises(SystemExit):
+        cli._decrypt_with_method("aes", "decryptre:v1:AAAA", args)
+
+    # The advertised total and the scanner must agree on the prefix, or the
+    # ETA and progress bar describe a scan that is not the one being run.
+    assert seen["kwargs"]["case_variant_prefix"] == 10_001
+    assert seen["total"] == cli.wordlists.expansion_count(
+        1_368_353, args.case_variants, "off", 10_001
+    )

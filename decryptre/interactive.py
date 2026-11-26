@@ -500,7 +500,8 @@ def _scan_modern_tier(
 
     alg = modern_crypto.container_alg(text) or "modern"
     workers = openssl_compat.default_workers()
-    candidates = wordlists.expansion_count(total, "common", "off")
+    prefix = wordlists.tier_count("small") if tier != "small" else None
+    candidates = wordlists.expansion_count(total, "common", "off", prefix)
     if not quiet:
         print(
             f"  Scanning the {tier} tier ({total:,} passphrases, up to "
@@ -529,6 +530,7 @@ def _scan_modern_tier(
         workers=workers,
         priority="background",
         case_variants="common",
+        case_variant_prefix=prefix,
         mutations="off",
     )
 

@@ -227,4 +227,32 @@ def test_modern_tier_scan_reports_an_estimate_and_streams(monkeypatch, capsys):
     assert seen["total"] == 30_003
     assert seen["kwargs"]["workers"] == 2
     assert seen["kwargs"]["case_variants"] == "common"
+    assert seen["kwargs"]["case_variant_prefix"] is None
     assert seen["kwargs"]["mutations"] == "off"
+
+
+def test_modern_tier_scan_limits_expansion_to_the_small_prefix(monkeypatch):
+    seen = {}
+    counts = {"small": 10_001, "medium": 1_368_353}
+    monkeypatch.setattr(interactive.wordlists, "tier_count", lambda tier: counts[tier])
+    monkeypatch.setattr(
+        interactive.wordlists, "iter_tier", lambda tier: iter([b"love"])
+    )
+    monkeypatch.setattr(interactive.openssl_compat, "default_workers", lambda: 1)
+    monkeypatch.setattr(
+        interactive.modern_crypto, "container_alg", lambda text: "aes-gcm"
+    )
+
+    def fake_stream(text, factory, total, **kwargs):
+        seen.update(total=total, kwargs=kwargs)
+        return []
+
+    monkeypatch.setattr(
+        interactive.modern_crypto, "dictionary_attack_stream", fake_stream
+    )
+
+    assert interactive._scan_modern_tier("token", "medium", quiet=True) == []
+    assert seen["kwargs"]["case_variant_prefix"] == 10_001
+    assert seen["total"] == interactive.wordlists.expansion_count(
+        1_368_353, "common", "off", 10_001
+    )

@@ -212,3 +212,34 @@ def test_parallel_mutation_scan_matches_the_serial_result(monkeypatch):
     assert [item.params["passphrase"] for item in parallel] == [
         item.params["passphrase"] for item in serial
     ]
+
+
+def test_stream_honours_the_case_variant_prefix(monkeypatch):
+    from decryptre import wordlist
+
+    token = modern_crypto.encrypt_aes(MESSAGE, "Love", mode="gcm")
+    words = [f"word{index:03d}".encode("ascii") for index in range(200)]
+    attempted = []
+    monkeypatch.setattr(
+        modern_crypto,
+        "try_decrypt",
+        lambda text, passphrase: attempted.append(passphrase),
+    )
+
+    total = wordlist.expansion_count(200, "common", "numbers", 5)
+    modern_crypto.dictionary_attack_stream(
+        token,
+        lambda: iter(words),
+        total,
+        top=1,
+        case_variants="common",
+        case_variant_prefix=5,
+        mutations="numbers",
+    )
+
+    # Only the five candidates inside the prefix are expanded, so the stream
+    # stops exactly at the advertised count instead of expanding all 200.
+    assert total == 360
+    assert len(attempted) == total
+    assert {"word000", "Word000", "WORD000", "word199"} <= set(attempted)
+    assert "Word199" not in attempted

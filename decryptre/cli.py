@@ -814,6 +814,7 @@ def _decrypt_with_method(method: str, text: str, args) -> List[Candidate]:
                 workers=workers,
                 priority=args.priority,
                 case_variants=args.case_variants,
+                case_variant_prefix=prefix,
                 mutations=mutations,
             )
             if not results:

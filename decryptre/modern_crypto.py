@@ -512,6 +512,7 @@ def dictionary_attack_stream(
     workers: int = 1,
     priority: str = "background",
     case_variants: str = "off",
+    case_variant_prefix: Optional[int] = None,
     mutations: str = "off",
 ) -> List[Candidate]:
     """Try a streamed wordlist against a DecryptRE container.
@@ -531,7 +532,7 @@ def dictionary_attack_stream(
     if case_variants != "off" or mutations != "off":
         base_factory = wordlist_factory
         wordlist_factory = lambda: iter_expansions(  # noqa: E731
-            base_factory(), case_variants, mutations
+            base_factory(), case_variants, mutations, case_variant_prefix
         )
     workers = max(1, workers)
     if workers > 1 and total >= PARALLEL_MIN_PASSPHRASES:
